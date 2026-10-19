@@ -203,6 +203,21 @@ describe("paper-mode tool surface", () => {
   });
 });
 
+describe("data context names", () => {
+  test("a JSON array sent as text is parsed, not split on its commas into bogus names", async () => {
+    const { json } = await connect();
+    for (const dataContextNames of ['["BetfairSpData","HorsesBaseBetfairFormData"]', ' [ "BetfairSpData", "HorsesBaseBetfairFormData" ] ', "[BetfairSpData, 'HorsesBaseBetfairFormData']"]) {
+      const env = await json("get_all_data_context_for_market", { marketId: WIN_MARKET, dataContextNames });
+      assert.equal(env.unavailableDataContexts, undefined, dataContextNames);
+      const fav = env.selectionsData.find((s: { selectionId: string }) => s.selectionId === "101");
+      assert.equal(fav.data.price, 3);
+      assert.equal(fav.data.weight, 140);
+    }
+    const one = await json("get_data_context_for_market_selection", { marketId: WIN_MARKET, selectionId: "101", dataContextNames: '["HorsesBaseBetfairFormData"]' });
+    assert.equal(one.selectionsData[0].data.weight, 140);
+  });
+});
+
 describe("tool naming modes", () => {
   test("legacy mode registers the PascalCase names prompts use", async () => {
     const { client, call } = await connect({ TOOL_NAMES: "legacy" });

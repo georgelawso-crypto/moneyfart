@@ -6,7 +6,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { loadConfig } from "../src/config.js";
 import { Connector } from "../src/connector.js";
-import { checkHttpSecurity, createHttpServer, hostname } from "../src/http.js";
+import { SESSION_IDLE_MS, checkHttpSecurity, createHttpServer, hostname, maxSessionsFromEnv } from "../src/http.js";
 import { FakeBetfair, WIN_MARKET } from "./fakeBetfair.js";
 
 const TOKEN = "s3cret-token";
@@ -32,9 +32,9 @@ const initBody = JSON.stringify({
   params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } },
 });
 
-async function start(env: Record<string, string>) {
+async function start(env: Record<string, string>, options: Parameters<typeof createHttpServer>[1] = {}) {
   const connector = new Connector(loadConfig({ RECORD_INTERVAL_SECONDS: "0", BOT_INTERVAL_SECONDS: "0", ...env }), new FakeBetfair());
-  const server = createHttpServer(connector);
+  const server = createHttpServer(connector, options);
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   return { base: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, close: () => server.close(), connector };
 }
@@ -125,6 +125,39 @@ describe("HTTP transport without a token", () => {
   test("serves direct loopback requests", async () => {
     const res = await raw(ctx.base, "/mcp", { body: initBody, headers: { Accept: "application/json, text/event-stream" } });
     assert.equal(res.status, 200);
+  });
+});
+
+describe("HTTP session limits", () => {
+  test("a session beyond the limit closes the least recently used one", async () => {
+    const ctx = await start({ MCP_AUTH_TOKEN: TOKEN }, { maxSessions: 2 });
+    try {
+      const headers = { Accept: "application/json, text/event-stream", Authorization: `Bearer ${TOKEN}` };
+      const list = (id: string) => raw(ctx.base, "/mcp", { headers: { ...headers, "mcp-session-id": id }, body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" }) });
+      const init = async () => {
+        const res = await raw(ctx.base, "/mcp", { headers, body: initBody });
+        assert.equal(res.status, 200);
+        return String(res.headers["mcp-session-id"]);
+      };
+      const a = await init();
+      const b = await init();
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      assert.equal((await list(a)).status, 200, "a is used again, so b is now the least recently used");
+      const c = await init();
+      assert.equal((await list(b)).status, 404, "b was closed to make room");
+      assert.equal((await list(a)).status, 200);
+      assert.equal((await list(c)).status, 200);
+    } finally {
+      ctx.close();
+    }
+  });
+
+  test("idle sessions expire after 30 minutes; MCP_MAX_SESSIONS sets the limit", () => {
+    assert.equal(SESSION_IDLE_MS, 30 * 60_000);
+    assert.equal(maxSessionsFromEnv({}), 100);
+    assert.equal(maxSessionsFromEnv({ MCP_MAX_SESSIONS: "7" }), 7);
+    assert.throws(() => maxSessionsFromEnv({ MCP_MAX_SESSIONS: "0" }), /MCP_MAX_SESSIONS/);
+    assert.throws(() => maxSessionsFromEnv({ MCP_MAX_SESSIONS: "lots" }), /MCP_MAX_SESSIONS/);
   });
 });
 
