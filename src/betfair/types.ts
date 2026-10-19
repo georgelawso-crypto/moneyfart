@@ -69,6 +69,8 @@ export interface MarketCatalogue {
     discountAllowed?: boolean;
     raceType?: string;
     eachWayDivisor?: number;
+    priceLadderDescription?: { type: "CLASSIC" | "FINEST" | "LINE_RANGE" };
+    lineRangeInfo?: { maxUnitValue: number; minUnitValue: number; interval: number; marketUnit: string };
   };
   totalMatched?: number;
   runners?: RunnerCatalog[];
@@ -141,7 +143,10 @@ export interface MarketBook {
   lastMatchTime?: string;
   totalMatched?: number;
   totalAvailable?: number;
+  crossMatching?: boolean;
+  runnersVoidable?: boolean;
   version?: number;
+  keyLineDescription?: { keyLine: Array<{ selectionId: number; handicap: number }> };
   runners: Runner[];
 }
 
@@ -221,6 +226,7 @@ export interface CurrentOrderSummary {
   sizeCancelled?: number;
   sizeVoided?: number;
   customerStrategyRef?: string;
+  customerOrderRef?: string;
 }
 
 export interface CurrentOrderSummaryReport {
@@ -259,6 +265,7 @@ export interface ClearedOrderSummary {
   sizeSettled?: number;
   profit?: number;
   sizeCancelled?: number;
+  customerOrderRef?: string;
   customerStrategyRef?: string;
 }
 
@@ -275,4 +282,16 @@ export interface AccountFunds {
   discountRate?: number;
   pointsBalance?: number;
   wallet?: string;
+}
+
+export interface AccountDetails {
+  currencyCode: string;
+  firstName?: string;
+  lastName?: string;
+  localeCode?: string;
+  region?: string;
+  timezone?: string;
+  discountRate?: number;
+  pointsBalance?: number;
+  countryCode?: string;
 }

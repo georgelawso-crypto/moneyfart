@@ -2,6 +2,7 @@ import fs from "node:fs";
 import https from "node:https";
 import type { Config } from "../config.js";
 import type {
+  AccountDetails,
   AccountFunds,
   CancelExecutionReport,
   CancelInstruction,
@@ -43,18 +44,24 @@ export interface BetfairApi {
     betIds?: string[];
     marketIds?: string[];
     orderProjection?: "ALL" | "EXECUTABLE" | "EXECUTION_COMPLETE";
+    customerOrderRefs?: string[];
+    customerStrategyRefs?: string[];
+    dateRange?: TimeRange;
     fromRecord?: number;
     recordCount?: number;
   }): Promise<CurrentOrderSummaryReport>;
   listClearedOrders(args: {
     betStatus: "SETTLED" | "VOIDED" | "LAPSED" | "CANCELLED";
     marketIds?: string[];
+    customerStrategyRefs?: string[];
     settledDateRange?: TimeRange;
+    groupBy?: "EVENT_TYPE" | "EVENT" | "MARKET" | "SIDE" | "BET" | "RUNNER" | "STRATEGY";
     includeItemDescription?: boolean;
     fromRecord?: number;
     recordCount?: number;
   }): Promise<ClearedOrderSummaryReport>;
   getAccountFunds(): Promise<AccountFunds>;
+  getAccountDetails(): Promise<AccountDetails>;
 }
 
 export class BetfairApiError extends Error {
@@ -258,5 +265,9 @@ export class BetfairClient implements BetfairApi {
 
   getAccountFunds() {
     return this.call<AccountFunds>("account", "getAccountFunds", {});
+  }
+
+  getAccountDetails() {
+    return this.call<AccountDetails>("account", "getAccountDetails", {});
   }
 }

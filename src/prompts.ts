@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { BFEXPLORER_ONLY_CONTEXTS } from "./dataContexts.js";
+import { BFEXPLORER_ONLY_CONTEXTS } from "./contexts/bfexplorerOnly.js";
 
 export interface PromptEntry {
   id: string;
