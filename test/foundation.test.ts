@@ -3,8 +3,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, test } from "node:test";
+import { currencyRules } from "../src/betfair/currency.js";
+import type { MarketBook } from "../src/betfair/types.js";
+import { DataContextService } from "../src/contexts/service.js";
+import { PaperExchange } from "../src/exchange/paper.js";
 import { localTime, parseTimeSpan, toToon, utcSeconds, compact } from "../src/format.js";
-import { MarketService } from "../src/markets.js";
+import { MarketService, type ArchivedMarket } from "../src/markets.js";
 import { Recorder, classifyTrade } from "../src/recorder.js";
 import { State } from "../src/state.js";
 import { FakeBetfair, PLACE_MARKET, WIN_MARKET } from "./fakeBetfair.js";
@@ -281,5 +285,118 @@ describe("state", () => {
       state.release();
     }
     assert.match(errors.join("\n"), /failed to save state/);
+  });
+});
+
+describe("out-of-order books", () => {
+  test("a late, older traded ladder never lowers the recorder's baseline, so volume is not counted twice", () => {
+    const fake = new FakeBetfair();
+    const recorder = new Recorder();
+    const book = (size: number) => {
+      const b = structuredClone(fake.book());
+      b.runners[0].ex!.tradedVolume = [{ price: 3.0, size }];
+      return b;
+    };
+    recorder.ingest(book(100), 1);
+    recorder.ingest(book(150), 2);
+    recorder.ingest(book(120), 3); // an older snapshot processed late
+    recorder.ingest(book(150), 4); // the next poll: nothing new traded
+    recorder.ingest(book(160), 5);
+    const sel = recorder.get(WIN_MARKET)!.selections.get("101")!;
+    assert.equal(sel.totals.volume, 60);
+    assert.deepEqual(sel.trades.map((t) => t.size), [50, 10]);
+  });
+
+  test("a response older than one already processed is neither recorded nor passed to listeners", async () => {
+    const { fake, markets, recorder } = setup();
+    const seen: Array<number | undefined> = [];
+    markets.onBook((book) => void seen.push(book.runners[0].ex?.tradedVolume?.find((l) => l.price === 3.05)?.size));
+    await markets.getBook(WIN_MARKET);
+    const original = fake.listMarketBook.bind(fake);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    fake.listMarketBook = async (args) => {
+      fake.listMarketBook = original;
+      const books = await original(args); // the snapshot is taken when the request is made
+      await gate;
+      return books;
+    };
+    const slowPoll = markets.getBooks([WIN_MARKET, PLACE_MARKET]); // e.g. the recorder's poll, answered late
+    fake.trade(101, 3.05, 50);
+    await markets.getBook(WIN_MARKET); // e.g. a tool call, answered at once
+    release();
+    await slowPoll;
+    fake.trade(101, 3.05, 10);
+    await markets.getBook(WIN_MARKET);
+    const sel = recorder.get(WIN_MARKET)!.selections.get("101")!;
+    assert.equal(sel.totals.volume, 60);
+    assert.deepEqual(sel.prices.map(([, price]) => price), [3.0, 3.05], "no flip back to the stale last traded price");
+    assert.deepEqual(seen, [undefined, 50, undefined, 60], "the stale WIN book never reached the listeners (the PLACE book did)");
+  });
+
+  test("Betfair's market version and last match time outrank the order of requests", async () => {
+    const { fake, markets } = setup();
+    const seen: string[] = [];
+    markets.onBook((book) => void seen.push(`${book.version}@${book.lastMatchTime?.slice(17, 19)}`));
+    const fetch = async (version: number, lastMatchTime?: string) => {
+      fake.book().version = version;
+      fake.book().lastMatchTime = lastMatchTime && `2026-10-19T10:00:${lastMatchTime}.000Z`;
+      await markets.getBook(WIN_MARKET);
+    };
+    await fetch(5, "05");
+    await fetch(4, "06"); // a lagging server answers a later request with an older market version
+    await fetch(5, "04"); // ... or with fewer matches
+    await fetch(5, "05"); // the same version and last match: the later request wins
+    await fetch(6);
+    assert.deepEqual(seen, ["5@05", "5@05", "6@undefined"]);
+  });
+});
+
+describe("settled-market archive", () => {
+  test("a market archived without its catalogue takes names and type from the paper orders, so race history keeps it", async () => {
+    const fake = new FakeBetfair();
+    const state = new State();
+    const before = new MarketService(fake, state, new Recorder(), 20);
+    const paper = new PaperExchange(before, state, { startingBalance: 1000, commissionRate: 0.05, currency: currencyRules("GBP") });
+    await paper.placeOrders(WIN_MARKET, [{ selectionId: 101, handicap: 0, side: "BACK", price: 3.0, size: 10, persistenceType: "LAPSE" }], { name: "T", ref: "T" });
+    // Restart: the catalogue cache is gone, and Betfair no longer returns the closed market's catalogue.
+    const markets = new MarketService(fake, state, new Recorder(), 20);
+    fake.settle([101], WIN_MARKET, { bsp: { 101: 3.2, 102: 7, 103: 5 } });
+    await markets.getBooks([WIN_MARKET]);
+    const archived: ArchivedMarket = state.archive.get(WIN_MARKET)!;
+    assert.equal(archived.marketName, "2m Hcap");
+    assert.equal(archived.marketType, "WIN");
+    assert.equal(archived.eventName, "Ascot 19th Oct");
+    assert.equal(archived.eventType, "Horse Racing");
+    assert.equal(archived.startTime, fake.startTime);
+    assert.deepEqual(archived.runners.map((r) => r.name), ["Fast Horse", "102", "103"]);
+    assert.equal(archived.incomplete, true, "the venue and the other runners' names are still unknown");
+
+    const contexts = new DataContextService(markets, state, { timeZone: "Europe/London" });
+    const env = await contexts.getForMarket(PLACE_MARKET, ["HorsesBetfairRaceInfoData"]);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const pastRaces = (env.selectionsData.find((s) => s.selectionId === "101")?.data as any)?.horseDetail?.pastRaces;
+    assert.equal(pastRaces?.length, 1);
+    assert.equal(pastRaces[0].price, 3.2);
+  });
+
+  test("a skeleton archive entry is completed by a catalogue fetched later", async () => {
+    const { fake, markets, state } = setup();
+    const closed: MarketBook = structuredClone(fake.book());
+    closed.status = "CLOSED";
+    closed.runners = closed.runners.map((r) => ({ ...r, status: r.selectionId === 101 ? "WINNER" : "LOSER" }));
+    markets.archiveSettled(closed); // e.g. a result looked up before any catalogue was fetched
+    let archived: ArchivedMarket = state.archive.get(WIN_MARKET)!;
+    assert.equal(archived.marketName, WIN_MARKET);
+    assert.equal(archived.marketType, undefined);
+    assert.equal(archived.incomplete, true);
+    await markets.getCatalogue(WIN_MARKET);
+    archived = state.archive.get(WIN_MARKET)!;
+    assert.equal(archived.marketName, "2m Hcap");
+    assert.equal(archived.marketType, "WIN");
+    assert.equal(archived.venue, "Ascot");
+    assert.equal(archived.startTime, fake.startTime);
+    assert.deepEqual(archived.runners.map((r) => [r.name, r.sortPriority, r.status]), [["Fast Horse", 1, "Winner"], ["Slow Horse", 2, "Loser"], ["Mid Horse", 3, "Loser"]]);
+    assert.equal(archived.incomplete, undefined);
   });
 });

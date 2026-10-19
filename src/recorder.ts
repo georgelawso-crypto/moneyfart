@@ -38,7 +38,7 @@ export interface SelectionRecording {
   bestBack?: number;
   bestLay?: number;
   status?: string;
-  /** Last EX_TRADED ladder seen (price -> cumulative size). */
+  /** EX_TRADED baseline: the largest cumulative size seen per price. */
   traded?: Map<number, number>;
   /** Trades reconstructed from traded-volume growth between polls, oldest first (the newest maxTradesPerSelection). */
   trades: Trade[];
@@ -65,6 +65,13 @@ export interface MarketRecording {
 
 function ladderMap(levels: PriceSize[] | undefined): Map<number, number> {
   return new Map((levels ?? []).map((l) => [l.price, l.size]));
+}
+
+/** Per-price maximum of two cumulative traded-volume ladders. */
+function maxLadder(baseline: Map<number, number>, ladder: Map<number, number>): Map<number, number> {
+  const merged = new Map(baseline);
+  for (const [price, size] of ladder) merged.set(price, Math.max(merged.get(price) ?? 0, size));
+  return merged;
 }
 
 export function classifyTrade(price: number, prevBack?: number, prevLay?: number): TradeSide {
@@ -149,7 +156,9 @@ export class Recorder {
       if (sel.startPrice === undefined && runner.lastPriceTraded) sel.startPrice = runner.lastPriceTraded;
       if (sel.startMatched === undefined && runner.totalMatched !== undefined) sel.startMatched = runner.totalMatched;
       if (ladder && sel.traded) this.diffTraded(sel, ladder, runner.lastPriceTraded, inPlay, now);
-      if (ladder) sel.traded = ladder;
+      // Traded volume only grows: an older ladder processed late must not lower the baseline, or the
+      // volume between the two snapshots would be recorded again.
+      if (ladder) sel.traded = sel.traded ? maxLadder(sel.traded, ladder) : ladder;
       const lastLogged = sel.prices[sel.prices.length - 1];
       if (runner.lastPriceTraded && (!lastLogged || lastLogged[1] !== runner.lastPriceTraded)) {
         sel.prices.push([now, runner.lastPriceTraded]);

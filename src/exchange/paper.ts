@@ -265,6 +265,31 @@ function runnerProblem(book: MarketBook, req: OrderRequest): string | undefined 
 const ladderType = (catalogue: MarketCatalogue): LadderType =>
   catalogue.description?.priceLadderDescription?.type === "FINEST" ? "FINEST" : "CLASSIC";
 
+// ------------------------------------------------------------------ settlement
+
+/**
+ * Betfair's dead-heat rule (Betfair Exchange Rules and Regulations, General Rules, "Dead Heats"):
+ * when more runners are returned WINNER than the market has winning places, the stake on each of
+ * them is divided. With n places and k winners, n/k of the stake is settled as a winner and the
+ * rest as a loser: a back of S at P returns S x (P - 1) x n/k - S x (1 - n/k), a lay the opposite.
+ * Exact when one place is shared. With several places Betfair divides only the stakes on the
+ * runners tied for the last place, which the results do not identify, so every winner takes the
+ * average share (an approximation). Runner.adjustmentFactor is not a dead-heat term: Betfair
+ * publishes it on every horse as the reduction factor its removal would cause.
+ */
+function deadHeatOf(book: MarketBook, knownPlaces?: number): { share: number; note: string } | undefined {
+  const places = book.numberOfWinners ?? knownPlaces;
+  // Several WINNER lines are normal in handicap markets.
+  if (!places || places < 1 || book.runners.some((r) => r.handicap)) return undefined;
+  const winners = book.runners.filter((r) => r.status === "WINNER").length;
+  if (winners <= places) return undefined;
+  const approximation = places > 1 ? " Betfair divides only the stakes on the runners tied for the last place, which the results do not name: this is an approximation." : "";
+  return {
+    share: places / winners,
+    note: `Dead heat: ${winners} winners for ${places} place(s); ${places}/${winners} of the stake was settled as a winner, the rest as a loser.${approximation}`,
+  };
+}
+
 // ------------------------------------------------------------------ exchange
 
 /**
@@ -272,7 +297,8 @@ const ladderType = (catalogue: MarketCatalogue): LadderType =>
  * displayed liquidity (depleted by everything this engine already took); the remainder rests
  * and fills only on evidence: the book crossing its price, or traded volume at the price beyond
  * the queue ahead of it, or through the price. Markets settle from Betfair's runner statuses,
- * including non-runners (void + reduction factors) and commission on net market winnings.
+ * including non-runners (void + reduction factors) and dead heats, with commission on net market
+ * winnings at the market's base rate.
  */
 export class PaperExchange implements Exchange {
   readonly mode = "paper" as const;
@@ -388,6 +414,9 @@ export class PaperExchange implements Exchange {
       marketType: catalogue.description?.marketType,
       eachWayDivisor: catalogue.description?.eachWayDivisor,
       numberOfWinners: book.numberOfWinners,
+      // Kept on the order: Betfair no longer returns the catalogue once the market has closed.
+      marketBaseRate: catalogue.description?.marketBaseRate,
+      bookVersion: book.version,
       meta: removals.length ? { removals } : {},
     };
     for (const fill of takeLiquidity(sel, runner, req.side, req.price, req.size)) addFill(order, fill.price, fill.size, placedAt);
@@ -524,14 +553,23 @@ export class PaperExchange implements Exchange {
   private onBook(book: MarketBook) {
     const orders = this.unsettled(book.marketId);
     if (!orders.length) return;
+    // MarketService drops books older than one it already processed; after a restart it has no
+    // history, so a book older than the one an order was placed on is ignored here too.
+    const version = book.version;
+    if (version !== undefined && orders.some((o) => o.bookVersion !== undefined && version < o.bookVersion)) return;
     const now = this.isoNow();
     const market = this.market(book.marketId);
     market.numberOfWinners = book.numberOfWinners ?? market.numberOfWinners;
     market.activeRunners = activeKeys(book);
     this.applyRemovals(book, orders, now);
-    this.applyLapses(book, orders);
+    // LAPSE orders placed before the off were cancelled at the off. Volume first seen in an in-play
+    // book may have traded before or after it and cannot be dated, so it is not credited to them.
+    this.applyLapses(book, orders, "off");
     const fresh = this.trackLiquidity(book, orders);
-    if (book.status === "OPEN" && !(book.isMarketDataDelayed && book.inplay)) this.fillResting(book, orders, fresh, now);
+    // Volume first seen in a SUSPENDED or CLOSED book traded while the market was open and these
+    // orders were resting: credit it before anything lapses or settles. Only OPEN offers can cross.
+    if (!(book.isMarketDataDelayed && book.inplay)) this.fillResting(book, orders, fresh, now, book.status === "OPEN");
+    this.applyLapses(book, orders, "close");
     // Results are final once no runner is ACTIVE (a CLOSED market can still await a photo or stewards).
     if (book.status === "CLOSED" && book.runners.every((r) => r.status !== "ACTIVE")) this.settle(book, now);
     this.prune(book.marketId);
@@ -568,14 +606,16 @@ export class PaperExchange implements Exchange {
     }
   }
 
-  /** Everything unmatched lapses at CLOSED or on a non-active runner; LAPSE orders placed before the off lapse at the off. */
-  private applyLapses(book: MarketBook, orders: PaperOrder[]) {
+  /** At the off, LAPSE orders placed before it lapse; at the close, everything unmatched at CLOSED or on a non-active runner does. */
+  private applyLapses(book: MarketBook, orders: PaperOrder[], at: "off" | "close") {
     for (const o of orders) {
       const remaining = sizeRemaining(o);
       if (o.settlement || remaining <= 0) continue;
-      const runner = findRunner(book, o);
-      const turnedInPlay = o.persistenceType === "LAPSE" && !o.placedInPlay && Boolean(book.inplay);
-      if (book.status === "CLOSED" || runner?.status !== "ACTIVE" || turnedInPlay) o.sizeLapsed = pennies(o.sizeLapsed + remaining);
+      const lapses =
+        at === "off"
+          ? o.persistenceType === "LAPSE" && !o.placedInPlay && Boolean(book.inplay)
+          : book.status === "CLOSED" || findRunner(book, o)?.status !== "ACTIVE";
+      if (lapses) o.sizeLapsed = pennies(o.sizeLapsed + remaining);
     }
   }
 
@@ -598,14 +638,17 @@ export class PaperExchange implements Exchange {
   /**
    * Resting fills, in Betfair's priority (BACK: lowest price first, LAY: highest; then time).
    * Each side draws on its own copy of the traded evidence, so one print never fills two of
-   * this engine's orders on the same side; all fills are at the order's own price.
+   * this engine's orders on the same side; all fills are at the order's own price. Only an OPEN
+   * book's ladders are live: other books (SUSPENDED, CLOSED) contribute traded volume alone.
    */
-  private fillResting(book: MarketBook, orders: PaperOrder[], fresh: Map<string, Map<string, number>>, now: string) {
+  private fillResting(book: MarketBook, orders: PaperOrder[], fresh: Map<string, Map<string, number>>, now: string, open: boolean) {
     const market = this.market(book.marketId);
     for (const runner of book.runners) {
       const key = keyOf(runner);
       const sel = market.selections[key];
-      if (!sel || runner.status !== "ACTIVE") continue;
+      // A settled WINNER or LOSER still traded until the close; bets on a removed runner are void.
+      if (!sel || isRemoved(runner)) continue;
+      const live = open && runner.status === "ACTIVE";
       for (const side of ["BACK", "LAY"] as const) {
         const resting = orders
           .filter((o) => !o.settlement && o.side === side && keyOf(o) === key && sizeRemaining(o) > 0)
@@ -614,20 +657,24 @@ export class PaperExchange implements Exchange {
         for (let i = 0; i < resting.length; ) {
           const group = [resting[i++]];
           while (i < resting.length && Math.abs(resting[i].price - group[0].price) < EPS) group.push(resting[i++]);
-          this.fillGroup(group, side, runner, sel, pool, now);
+          this.fillGroup(group, side, runner, sel, pool, now, live);
         }
       }
     }
   }
 
-  /** Fill orders resting at one price. */
-  private fillGroup(group: PaperOrder[], side: Side, runner: Runner, sel: PaperSelectionLiquidity, pool: Map<string, number>, now: string) {
+  /**
+   * Fill orders resting at one price. Each unit of volume traded at the price is used once: it
+   * first clears money queued ahead, and only the excess fills these orders.
+   */
+  private fillGroup(group: PaperOrder[], side: Side, runner: Runner, sel: PaperSelectionLiquidity, pool: Map<string, number>, now: string, live: boolean) {
     const price = group[0].price;
     const own = restsIn(side);
-    const shownOwn = shownAt(ladderOf(runner, own), own, price);
-    // Money ahead in the queue cannot exceed what is still displayed at the price.
-    const queues = group.map((o) => Math.min(meta(o).queue ?? Infinity, shownOwn ?? Infinity));
+    // The book shows the level after this interval's trades (a suspended book's empty ladder says nothing).
+    const shownOwn = live ? shownAt(ladderOf(runner, own), own, price) : undefined;
     const atPrice = pool.get(priceKey(price)) ?? 0;
+    // Money ahead before those trades cannot exceed what is still displayed plus what traded at the price.
+    const queues = group.map((o) => Math.min(meta(o).queue ?? Infinity, (shownOwn ?? Infinity) + atPrice));
     // Volume traded at the price first clears the shortest queue ahead; the excess may reach these orders.
     let excessPool = Math.max(0, atPrice - Math.min(...queues));
     const through = [...pool.keys()]
@@ -637,7 +684,7 @@ export class PaperExchange implements Exchange {
     group.forEach((o, i) => {
       let left = sizeRemaining(o);
       // (a) The book crossed the price: offers at or better than it would have matched this order.
-      for (const t of takeLiquidity(sel, runner, side, price, left)) {
+      for (const t of live ? takeLiquidity(sel, runner, side, price, left) : []) {
         addFill(o, price, t.size, now);
         left = pennies(left - t.size);
       }
@@ -656,7 +703,9 @@ export class PaperExchange implements Exchange {
         excessPool = pennies(excessPool - x);
         addFill(o, price, x, now);
       }
-      meta(o).queue = Number.isFinite(queues[i]) ? Math.max(0, pennies(queues[i] - atPrice)) : null;
+      // What is left ahead after the trades, never more than the level still shows.
+      const queue = Math.min(Math.max(0, pennies(queues[i] - atPrice)), shownOwn ?? Infinity);
+      meta(o).queue = Number.isFinite(queue) ? queue : null;
     });
   }
 
@@ -664,6 +713,7 @@ export class PaperExchange implements Exchange {
 
   private settle(book: MarketBook, now: string) {
     const orders = this.unsettled(book.marketId);
+    const deadHeat = deadHeatOf(book, this.market(book.marketId).numberOfWinners);
     let gross = 0;
     for (const o of orders) {
       o.sizeLapsed = pennies(o.sizeLapsed + sizeRemaining(o));
@@ -674,9 +724,15 @@ export class PaperExchange implements Exchange {
       }
       // PLACED only occurs in EACH_WAY markets, which paper mode refuses: it is not a win.
       const wins = status === "WINNER";
-      const profit = o.fills.reduce((total, f) => total + betOutcomeProfit(o.side, f.price, f.size, wins), 0);
+      // Share of each stake settled as a winner (below 1 only for a winner in a dead heat), the rest as a loser.
+      const share = wins && deadHeat ? deadHeat.share : 1;
+      const profit = o.fills.reduce(
+        (total, f) => total + share * betOutcomeProfit(o.side, f.price, f.size, wins) + (1 - share) * betOutcomeProfit(o.side, f.price, f.size, false),
+        0,
+      );
       gross += profit;
       o.settlement = { outcome: (o.side === "BACK") === wins ? "WON" : "LOST", profit, settledDate: now };
+      if (share < 1) meta(o).note = deadHeat!.note;
     }
     this.recordSettlement(book.marketId, orders, gross, now);
   }
@@ -688,13 +744,15 @@ export class PaperExchange implements Exchange {
     meta(o).note = note;
   }
 
-  /** One settlement per market; commission is charged on net market winnings. */
+  /** One settlement per market; commission is charged on net market winnings at the market's base rate. */
   private recordSettlement(marketId: string, orders: PaperOrder[], gross: number, now: string, note?: string) {
-    const commission = (profit: number) => this.options.commissionRate * Math.max(0, profit);
     const existing = this.state.paper.settlements.find((s) => s.marketId === marketId);
+    const rate = existing?.commissionRate ?? this.commissionRate(marketId);
+    const commission = (profit: number) => rate * Math.max(0, profit);
     if (existing) {
       existing.grossProfit += gross;
       existing.commission = commission(existing.grossProfit);
+      existing.commissionRate = rate;
       return;
     }
     const named = orders.find((o) => o.marketName) ?? orders[0];
@@ -704,9 +762,18 @@ export class PaperExchange implements Exchange {
       eventName: named?.eventName ?? "",
       grossProfit: gross,
       commission: commission(gross),
+      commissionRate: rate,
       settledDate: now,
       note,
     });
+  }
+
+  /** Betfair charges each market's own base rate (a percentage in its catalogue); PAPER_COMMISSION_RATE when it is unknown. */
+  private commissionRate(marketId: string): number {
+    const baseRate =
+      this.state.paper.orders.find((o) => o.marketId === marketId && o.marketBaseRate !== undefined)?.marketBaseRate ??
+      this.markets.cachedCatalogue(marketId)?.description?.marketBaseRate;
+    return baseRate !== undefined && Number.isFinite(baseRate) && baseRate >= 0 ? baseRate / 100 : this.options.commissionRate;
   }
 
   /** Betfair purges settled markets; one that never showed a result cannot hold exposure forever. */

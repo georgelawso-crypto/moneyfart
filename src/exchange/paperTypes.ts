@@ -39,6 +39,10 @@ export interface PaperOrder {
   marketType?: string;
   eachWayDivisor?: number;
   numberOfWinners?: number;
+  /** The market's base rate (percent) from its catalogue: the commission rate charged at settlement. */
+  marketBaseRate?: number;
+  /** Betfair version of the book the order was placed on: books of an older version are ignored. */
+  bookVersion?: number;
   /** Filled in when the market settles. */
   settlement?: {
     outcome: "WON" | "LOST" | "VOID" | "PLACE";
@@ -55,6 +59,8 @@ export interface PaperMarketSettlement {
   eventName: string;
   grossProfit: number;
   commission: number;
+  /** Rate charged on net winnings (the market base rate when known, else PAPER_COMMISSION_RATE). */
+  commissionRate?: number;
   settledDate: string;
   /** Set when the market was settled without a result (e.g. Betfair stopped returning it). */
   note?: string;

@@ -40,6 +40,8 @@ const CATALOGUE_TTL_MS = 5 * 60 * 1000;
 const EVENT_TYPES_TTL_MS = 60 * 60 * 1000;
 /** Betfair's market data request limit (sum of projection weights x markets). */
 const MAX_WEIGHT = 200;
+/** Markets whose latest processed book is remembered (to drop responses that arrive out of order). */
+const MAX_BOOK_STAMPS = 2000;
 
 /** BFExplorer's "My favourite bet events" groups, reproduced as market searches. */
 export const FAVOURITE_BET_EVENTS: Record<string, FindMarketsQuery> = {
@@ -137,6 +139,28 @@ export interface BfexplorerMarket {
 
 type BookListener = (book: MarketBook) => void | Promise<void>;
 
+/** A settled market archived before its catalogue was known: names, type and venue are still missing. */
+export type ArchivedMarket = SettledMarket & { incomplete?: boolean };
+
+/** How recent a processed book is: Betfair's market version, its last match time, then the request order. */
+interface BookStamp {
+  version?: number;
+  lastMatchTime?: number;
+  /** Taken before the request was sent: a later request returns the same or a newer book. */
+  request: number;
+}
+
+/**
+ * Positive when `a` is newer. Betfair's version only changes with the market definition (status,
+ * in-play, removals) and lastMatchTime only with trading, so between equal ones (or when a book
+ * lacks them) the later request decides.
+ */
+function compareStamps(a: BookStamp, b: BookStamp): number {
+  if (a.version !== undefined && b.version !== undefined && a.version !== b.version) return a.version - b.version;
+  if (a.lastMatchTime !== undefined && b.lastMatchTime !== undefined && a.lastMatchTime !== b.lastMatchTime) return a.lastMatchTime - b.lastMatchTime;
+  return a.request - b.request;
+}
+
 function projectionWeight(opts: BookOptions): number {
   const depth = Math.max(1, opts.depth ?? 3);
   let weight = opts.allOffers ? 17 : Math.ceil((5 * depth) / 3);
@@ -149,6 +173,9 @@ export class MarketService {
   private catalogueCache = new Map<string, { at: number; catalogue: MarketCatalogue }>();
   private eventTypes?: { at: number; items: { id: string; name: string }[] };
   private listeners: BookListener[] = [];
+  private requests = 0;
+  /** Latest book processed per market, least recently processed first. */
+  private readonly processed = new Map<string, BookStamp>();
 
   constructor(
     readonly api: BetfairApi,
@@ -258,6 +285,7 @@ export class MarketService {
         monitored.catalogue = catalogue;
         this.state.changed();
       }
+      this.repairArchive(id);
       return catalogue;
     }
     const fallback = this.cachedCatalogue(id);
@@ -284,7 +312,10 @@ export class MarketService {
       maxResults: 10,
     });
     const match = candidates.find((c) => !start || c.marketStartTime === start) ?? candidates[0];
-    if (match) this.catalogueCache.set(match.marketId, { at: Date.now(), catalogue: match });
+    if (match) {
+      this.catalogueCache.set(match.marketId, { at: Date.now(), catalogue: match });
+      this.repairArchive(match.marketId);
+    }
     return match;
   }
 
@@ -312,23 +343,42 @@ export class MarketService {
       virtualise: true,
     };
     const perRequest = Math.max(1, Math.floor(MAX_WEIGHT / projectionWeight(opts)));
-    const books: MarketBook[] = [];
+    const books: Array<{ book: MarketBook; request: number }> = [];
+    const fetch = async (marketIds: string[]) => {
+      const request = ++this.requests; // before sending: concurrent calls can be answered out of order
+      const result = await this.api.listMarketBook({ marketIds, priceProjection: projection });
+      for (const book of result) books.push({ book, request });
+      return result;
+    };
     for (let i = 0; i < ids.length; i += perRequest) {
       const batch = ids.slice(i, i + perRequest);
-      const result = await this.api.listMarketBook({ marketIds: batch, priceProjection: projection });
-      books.push(...result);
+      const result = await fetch(batch);
       if (batch.length > 1) {
         const returned = new Set(result.map((b) => b.marketId));
-        for (const missing of batch.filter((id) => !returned.has(id))) {
-          books.push(...(await this.api.listMarketBook({ marketIds: [missing], priceProjection: projection })));
-        }
+        for (const missing of batch.filter((id) => !returned.has(id))) await fetch([missing]);
       }
     }
-    for (const book of books) await this.process(book);
-    return books;
+    for (const { book, request } of books) await this.process(book, request);
+    return books.map(({ book }) => book);
   }
 
-  private async process(book: MarketBook) {
+  /**
+   * Record a book as the market's latest unless a newer one was already processed (a slower,
+   * older response must not roll back the recorder, statuses or paper matching).
+   */
+  private isLatest(book: MarketBook, request: number): boolean {
+    const matched = Date.parse(book.lastMatchTime ?? "");
+    const stamp: BookStamp = { version: book.version, lastMatchTime: Number.isFinite(matched) ? matched : undefined, request };
+    const last = this.processed.get(book.marketId);
+    if (last && compareStamps(stamp, last) < 0) return false;
+    this.processed.delete(book.marketId);
+    this.processed.set(book.marketId, stamp);
+    if (this.processed.size > MAX_BOOK_STAMPS) this.processed.delete(this.processed.keys().next().value as string);
+    return true;
+  }
+
+  private async process(book: MarketBook, request: number) {
+    if (!this.isLatest(book, request)) return;
     this.recorder.ingest(book);
     const monitored = this.state.monitored.get(book.marketId);
     const status = marketStatusName(book.status);
@@ -366,30 +416,25 @@ export class MarketService {
 
   /**
    * Record a settled market's results (runner statuses, BSP, in-play range) in the archive, or add
-   * BSPs to an entry archived earlier without them.
+   * BSPs (and names, once known) to an entry archived earlier without them.
    */
   archiveSettled(book: MarketBook) {
     const bsp = new Map(book.runners.map((r) => [formatSelectionId(r.selectionId, r.handicap), finiteOrUndefined(r.sp?.actualSP)]));
-    const existing = this.state.archive.get(book.marketId);
+    const existing: ArchivedMarket | undefined = this.state.archive.get(book.marketId);
     if (existing) {
-      if ([...bsp.values()].every((v) => v === undefined)) return;
-      const runners = existing.runners.map((r) => ({ ...r, bsp: r.bsp ?? bsp.get(formatSelectionId(r.selectionId, r.handicap)) }));
-      this.state.archiveMarket({ ...existing, runners });
+      const completed = existing.incomplete ? this.completeArchive(existing) : existing;
+      if (completed === existing && [...bsp.values()].every((v) => v === undefined)) return;
+      const runners = completed.runners.map((r) => ({ ...r, bsp: r.bsp ?? bsp.get(formatSelectionId(r.selectionId, r.handicap)) }));
+      this.state.archiveMarket({ ...completed, runners });
       return;
     }
     const catalogue = this.cachedCatalogue(book.marketId);
     const rec = this.recorder.get(book.marketId);
     const names = new Map((catalogue?.runners ?? []).map((r) => [formatSelectionId(r.selectionId, r.handicap), r]));
-    const settled: SettledMarket = {
+    const settled: ArchivedMarket = {
       marketId: book.marketId,
       marketName: catalogue?.marketName ?? book.marketId,
-      eventId: catalogue?.event?.id || undefined,
-      eventName: catalogue?.event?.name || undefined,
-      venue: catalogue?.event?.venue,
-      countryCode: catalogue?.event?.countryCode,
-      eventType: catalogue?.eventType?.name,
-      marketType: catalogue?.description?.marketType,
-      startTime: catalogue?.marketStartTime,
+      ...catalogueFields(catalogue),
       settledAt: new Date().toISOString(),
       numberOfWinners: book.numberOfWinners,
       runners: book.runners.map((r) => {
@@ -408,7 +453,57 @@ export class MarketService {
         };
       }),
     };
-    this.state.archiveMarket(settled);
+    // Betfair stops returning a catalogue once its market closes (e.g. one first seen after a restart):
+    // keep what the paper orders recorded, and let a catalogue fetched later complete the entry.
+    this.state.archiveMarket(catalogue ? settled : this.completeArchive({ ...settled, incomplete: true }));
+  }
+
+  /** Complete an archive entry made before the market's catalogue was known, once there is something to add. */
+  private repairArchive(marketId: string) {
+    const entry: ArchivedMarket | undefined = this.state.archive.get(marketId);
+    if (!entry?.incomplete) return;
+    const completed = this.completeArchive(entry);
+    if (completed !== entry) this.state.archiveMarket(completed);
+  }
+
+  /**
+   * An incomplete archive entry with what is known since: a catalogue fetched meanwhile completes it;
+   * otherwise the paper orders' names, market type and start time fill the gaps. Returns the entry
+   * itself when nothing can be added.
+   */
+  private completeArchive(entry: ArchivedMarket): ArchivedMarket {
+    const catalogue = this.catalogueCache.get(entry.marketId)?.catalogue ?? this.state.monitored.get(entry.marketId)?.catalogue;
+    if (catalogue) {
+      const { incomplete: _incomplete, ...rest } = entry;
+      const names = new Map((catalogue.runners ?? []).map((r) => [formatSelectionId(r.selectionId, r.handicap), r]));
+      return {
+        ...rest,
+        marketName: catalogue.marketName,
+        ...catalogueFields(catalogue, entry),
+        runners: entry.runners.map((r) => {
+          const rc = names.get(formatSelectionId(r.selectionId, r.handicap));
+          return rc ? { ...r, name: rc.runnerName, sortPriority: rc.sortPriority } : r;
+        }),
+      };
+    }
+    const orders = this.state.paper.orders.filter((o) => o.marketId === entry.marketId);
+    const known = (values: Array<string | undefined>) => values.find(Boolean);
+    const selectionNames = new Map(orders.filter((o) => o.selectionName).map((o) => [formatSelectionId(o.selectionId, o.handicap), o.selectionName]));
+    const runners = entry.runners.map((r) => {
+      const key = formatSelectionId(r.selectionId, r.handicap);
+      const name = r.name === key ? selectionNames.get(key) : undefined;
+      return name ? { ...r, name } : r;
+    });
+    const filled: ArchivedMarket = {
+      ...entry,
+      marketName: entry.marketName === entry.marketId ? (known(orders.map((o) => o.marketName)) ?? entry.marketName) : entry.marketName,
+      eventName: entry.eventName ?? known(orders.map((o) => o.eventName)),
+      eventType: entry.eventType ?? known(orders.map((o) => o.eventType)),
+      marketType: entry.marketType ?? known(orders.map((o) => o.marketType)),
+      startTime: entry.startTime ?? known(orders.map((o) => o.marketStartTime)),
+      runners: runners.some((r, i) => r !== entry.runners[i]) ? runners : entry.runners,
+    };
+    return (Object.keys(filled) as Array<keyof ArchivedMarket>).some((k) => filled[k] !== entry[k]) ? filled : entry;
   }
 
   // ------------------------------------------------------------------ monitoring
@@ -559,6 +654,19 @@ export class MarketService {
 
 function finiteOrUndefined(value: number | undefined): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+/** The settled archive's market fields that come from a catalogue (else from what is already `known`). */
+function catalogueFields(catalogue: MarketCatalogue | undefined, known?: SettledMarket) {
+  return {
+    eventId: catalogue?.event?.id || known?.eventId,
+    eventName: catalogue?.event?.name || known?.eventName,
+    venue: catalogue?.event?.venue ?? known?.venue,
+    countryCode: catalogue?.event?.countryCode ?? known?.countryCode,
+    eventType: catalogue?.eventType?.name ?? known?.eventType,
+    marketType: catalogue?.description?.marketType ?? known?.marketType,
+    startTime: catalogue?.marketStartTime ?? known?.startTime,
+  };
 }
 
 function indexIn(order: string[], key: string): number {
