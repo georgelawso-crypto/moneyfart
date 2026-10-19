@@ -176,6 +176,8 @@ export class MarketService {
   private requests = 0;
   /** Latest book processed per market, least recently processed first. */
   private readonly processed = new Map<string, BookStamp>();
+  /** Books getBooks returned although a newer book of their market had already been processed. */
+  private readonly stale = new WeakSet<MarketBook>();
 
   constructor(
     readonly api: BetfairApi,
@@ -377,8 +379,16 @@ export class MarketService {
     return true;
   }
 
+  /** True for a book that was older than one already processed when it arrived (it was not applied). */
+  isStale(book: MarketBook): boolean {
+    return this.stale.has(book);
+  }
+
   private async process(book: MarketBook, request: number) {
-    if (!this.isLatest(book, request)) return;
+    if (!this.isLatest(book, request)) {
+      this.stale.add(book);
+      return;
+    }
     this.recorder.ingest(book);
     const monitored = this.state.monitored.get(book.marketId);
     const status = marketStatusName(book.status);

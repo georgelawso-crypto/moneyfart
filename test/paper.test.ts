@@ -942,3 +942,35 @@ describe("paper: dead heats and commission", () => {
     close((await unknown.paper.settledBets(new Date(0))).commission!, 0.4);
   });
 });
+
+describe("paper: placement on an out-of-order book", () => {
+  test("an order is never matched against a placement book older than one already processed", async () => {
+    const { fake, markets, place, order } = setup();
+    fake.setOffers(101, [[3.2, 50], [3.0, 100]], [[3.25, 80]]);
+    fake.trade(101, 3.2, 100);
+    const original = fake.listMarketBook.bind(fake);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    let requested!: () => void;
+    const sent = new Promise<void>((resolve) => (requested = resolve));
+    fake.listMarketBook = async (args) => {
+      fake.listMarketBook = original;
+      const books = await original(args); // the placement's snapshot, taken when its request is made
+      requested();
+      await gate;
+      return books;
+    };
+    const placing = place([back(101, 3.2, 20, "PERSIST")]);
+    await sent;
+    fake.setOffers(101, [[3.0, 100]], [[3.05, 80]]); // the 3.2 offers are taken
+    fake.trade(101, 3.2, 50);
+    await markets.getBook(WIN_MARKET); // a later request (e.g. a recorder poll) is answered first
+    release();
+    const [bet] = await placing;
+    assert.equal(bet.sizeMatched, 0, "the vanished 3.2 offers must not match the order");
+    assert.deepEqual(order(bet.betId!).fills, []);
+    fake.trade(101, 3.05, 10);
+    await markets.getBook(WIN_MARKET);
+    assert.deepEqual(order(bet.betId!).fills, [], "volume traded at 3.2 before the order was placed is not evidence for it");
+  });
+});

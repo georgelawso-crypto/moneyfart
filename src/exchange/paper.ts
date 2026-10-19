@@ -332,7 +332,7 @@ export class PaperExchange implements Exchange {
       catalogueError = error;
     }
     // Fetching the book first applies it to resting orders (fills, lapses) before matching new ones.
-    let book = await this.markets.getBook(id, { depth: PLACE_DEPTH });
+    let book = await this.placementBook(id);
     const marketError = marketProblem(book);
     if (marketError) return orders.map((req) => failure(req, marketError));
     if (!catalogue) throw catalogueError;
@@ -343,7 +343,7 @@ export class PaperExchange implements Exchange {
     if (book.inplay && (book.betDelay ?? 0) > 0 && problems.some((p) => !p)) {
       // Betfair holds in-play bets for the bet delay, then matches them against the book at that moment.
       await this.sleep(book.betDelay! * 1000);
-      book = await this.markets.getBook(id, { depth: PLACE_DEPTH });
+      book = await this.placementBook(id);
     }
     // From here on no awaits: the batch matches atomically against one book, depleting it as it goes.
     const placedAt = this.isoNow();
@@ -353,6 +353,16 @@ export class PaperExchange implements Exchange {
       if (this.wouldOverdraw(book, req)) return failure(req, "INSUFFICIENT_FUNDS");
       return this.execute(req, book, market, strategy, placedAt);
     });
+  }
+
+  /**
+   * The book new orders match against. A response older than one already processed (answered
+   * late, or by a lagging server) would match vanished offers and date earlier trades after the
+   * order, so it is requested once more.
+   */
+  private async placementBook(marketId: string): Promise<MarketBook> {
+    const book = await this.markets.getBook(marketId, { depth: PLACE_DEPTH });
+    return this.markets.isStale(book) ? this.markets.getBook(marketId, { depth: PLACE_DEPTH }) : book;
   }
 
   private orderProblem(req: OrderRequest, book: MarketBook, catalogue: MarketCatalogue): string | undefined {
@@ -561,6 +571,8 @@ export class PaperExchange implements Exchange {
     const market = this.market(book.marketId);
     market.numberOfWinners = book.numberOfWinners ?? market.numberOfWinners;
     market.activeRunners = activeKeys(book);
+    // Volume first seen in a book showing a new non-runner cannot be dated against the removal either
+    // (the market may have reopened at reduced prices since): orders cancelled by it get none of it.
     this.applyRemovals(book, orders, now);
     // LAPSE orders placed before the off were cancelled at the off. Volume first seen in an in-play
     // book may have traded before or after it and cannot be dated, so it is not credited to them.
