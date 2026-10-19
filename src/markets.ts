@@ -337,8 +337,9 @@ export class MarketService {
       monitored.inPlay = Boolean(book.inplay);
       this.state.changed();
     }
-    if (book.status === "CLOSED" && book.runners.every((r) => r.status !== "ACTIVE") && !this.state.archive.has(book.marketId)) {
-      this.archive(book);
+    if (book.status === "CLOSED" && book.runners.every((r) => r.status !== "ACTIVE")) {
+      const archived = this.state.archive.get(book.marketId);
+      if (!archived || archived.runners.every((r) => r.bsp === undefined)) await this.archiveWithSp(book);
     }
     for (const listener of this.listeners) {
       try {
@@ -349,15 +350,41 @@ export class MarketService {
     }
   }
 
-  private archive(book: MarketBook) {
+  /** Archive a settled book, fetching Betfair Starting Prices when the book was requested without SP. */
+  private async archiveWithSp(book: MarketBook) {
+    let withSp = book;
+    if (book.runners.every((r) => r.sp === undefined)) {
+      try {
+        const [spBook] = await this.api.listMarketBook({ marketIds: [book.marketId], priceProjection: { priceData: ["SP_TRADED"] } });
+        if (spBook) withSp = spBook;
+      } catch {
+        // BSPs are optional; archive the result without them.
+      }
+    }
+    this.archiveSettled(withSp);
+  }
+
+  /**
+   * Record a settled market's results (runner statuses, BSP, in-play range) in the archive, or add
+   * BSPs to an entry archived earlier without them.
+   */
+  archiveSettled(book: MarketBook) {
+    const bsp = new Map(book.runners.map((r) => [formatSelectionId(r.selectionId, r.handicap), finiteOrUndefined(r.sp?.actualSP)]));
+    const existing = this.state.archive.get(book.marketId);
+    if (existing) {
+      if ([...bsp.values()].every((v) => v === undefined)) return;
+      const runners = existing.runners.map((r) => ({ ...r, bsp: r.bsp ?? bsp.get(formatSelectionId(r.selectionId, r.handicap)) }));
+      this.state.archiveMarket({ ...existing, runners });
+      return;
+    }
     const catalogue = this.cachedCatalogue(book.marketId);
     const rec = this.recorder.get(book.marketId);
     const names = new Map((catalogue?.runners ?? []).map((r) => [formatSelectionId(r.selectionId, r.handicap), r]));
     const settled: SettledMarket = {
       marketId: book.marketId,
       marketName: catalogue?.marketName ?? book.marketId,
-      eventId: catalogue?.event?.id,
-      eventName: catalogue?.event?.name,
+      eventId: catalogue?.event?.id || undefined,
+      eventName: catalogue?.event?.name || undefined,
       venue: catalogue?.event?.venue,
       countryCode: catalogue?.event?.countryCode,
       eventType: catalogue?.eventType?.name,
@@ -374,7 +401,7 @@ export class MarketService {
           name: names.get(key)?.runnerName ?? key,
           status: runnerStatusName(r.status) ?? r.status,
           sortPriority: names.get(key)?.sortPriority,
-          bsp: r.sp?.actualSP,
+          bsp: bsp.get(key),
           inPlayMin: sel?.inPlayMin,
           inPlayMax: sel?.inPlayMax,
           lastPriceTraded: r.lastPriceTraded,
@@ -402,15 +429,34 @@ export class MarketService {
     };
     this.state.monitored.delete(entry.marketId);
     this.state.monitored.set(entry.marketId, entry);
-    while (this.state.monitored.size > this.maxMonitoredMarkets) {
-      this.state.monitored.delete(this.state.monitored.keys().next().value as string);
-    }
+    this.evictMonitored(entry);
     if (options.activate) {
       if (this.state.activeMarketId !== entry.marketId) this.state.activeSelectionId = undefined;
       this.state.activeMarketId = entry.marketId;
     }
     this.state.changed();
     return { catalogue, book };
+  }
+
+  /**
+   * Keep the monitored list within MAX_MONITORED_MARKETS: drop closed markets first, then
+   * companions (PLACE markets read for a WIN market), then the oldest primary market. Opening a
+   * companion never evicts a primary market (the list may then briefly exceed the limit).
+   */
+  private evictMonitored(added: MonitoredMarket) {
+    const monitored = this.state.monitored;
+    const candidates = (predicate: (m: MonitoredMarket) => boolean) =>
+      [...monitored.values()].filter((m) => m.marketId !== added.marketId && predicate(m));
+    while (monitored.size > this.maxMonitoredMarkets) {
+      const victim =
+        candidates((m) => m.status === "Closed")[0] ??
+        candidates((m) => Boolean(m.companionOf))[0] ??
+        (added.companionOf ? undefined : candidates(() => true)[0]);
+      if (!victim) return;
+      monitored.delete(victim.marketId);
+      // A companion is only useful with its primary market.
+      for (const m of [...monitored.values()]) if (m.companionOf === victim.marketId) monitored.delete(m.marketId);
+    }
   }
 
   /** Market ids the recorder should poll: monitored markets that are not closed. */
@@ -509,6 +555,10 @@ export class MarketService {
     if (!key) throw new Error(`Unknown favourite bet event "${name}". Available: ${this.favouriteBetEvents().join(", ")}`);
     return this.findMarkets({ ...FAVOURITE_BET_EVENTS[key], maxResults: 50 });
   }
+}
+
+function finiteOrUndefined(value: number | undefined): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
 function indexIn(order: string[], key: string): number {

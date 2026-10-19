@@ -14,13 +14,14 @@ const TOKEN = "s3cret-token";
 /** Raw request with full control over headers (fetch() cannot set Host). */
 function raw(base: string, path: string, options: { method?: string; headers?: Record<string, string>; body?: string } = {}) {
   return new Promise<{ status: number; headers: http.IncomingHttpHeaders; body: string }>((resolve, reject) => {
-    const req = http.request(`${base}${path}`, { method: options.method ?? "POST", headers: { "Content-Type": "application/json", ...options.headers } }, (res) => {
+    const method = options.method ?? "POST";
+    const req = http.request(`${base}${path}`, { method, agent: false, headers: { "Content-Type": "application/json", ...options.headers } }, (res) => {
       let body = "";
       res.on("data", (c) => (body += c));
       res.on("end", () => resolve({ status: res.statusCode ?? 0, headers: res.headers, body }));
     });
     req.on("error", reject);
-    req.end(options.body ?? "{}");
+    req.end(method === "POST" ? (options.body ?? "{}") : undefined);
   });
 }
 

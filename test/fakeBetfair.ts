@@ -1,5 +1,6 @@
 import type { BetfairApi } from "../src/betfair/client.js";
 import type {
+  CancelExecutionReport,
   ClearedOrderSummary,
   CurrentOrderSummary,
   MarketBook,
@@ -193,7 +194,7 @@ export class FakeBetfair implements BetfairApi {
     const f = args.filter;
     const projection = new Set(args.marketProjection ?? []);
     return [...this.catalogues.values()]
-      .filter((c) => this.books.get(c.marketId)!.status !== "CLOSED") // Betfair never returns closed catalogues
+      .filter((c) => this.books.get(c.marketId)?.status !== "CLOSED") // Betfair never returns closed catalogues
       .filter((c) => !f.marketIds || f.marketIds.includes(c.marketId))
       .filter((c) => !f.eventIds || f.eventIds.includes(c.event!.id))
       .filter((c) => !f.marketTypeCodes || f.marketTypeCodes.includes(c.description!.marketType!))
@@ -271,7 +272,7 @@ export class FakeBetfair implements BetfairApi {
     };
   }
 
-  async cancelOrders(args: Parameters<BetfairApi["cancelOrders"]>[0]) {
+  async cancelOrders(args: Parameters<BetfairApi["cancelOrders"]>[0]): Promise<CancelExecutionReport> {
     this.calls.push({ method: "cancelOrders", args });
     const targets = this.liveOrders.filter(
       (o) => o.marketId === args.marketId && (o.sizeRemaining ?? 0) > 0 && (!args.instructions || args.instructions.some((i) => i.betId === o.betId)),

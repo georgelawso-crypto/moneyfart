@@ -919,7 +919,7 @@ describe("review: feedback results", () => {
     assert.equal(fake.calls.filter((c) => c.method === "listMarketBook" && c.args.marketIds.includes(WIN_MARKET)).length, 0);
   });
 
-  test("fills in BSPs missing from a market archived from a book without SP", async () => {
+  test("a poll without SP still archives settled BSPs (fetched separately)", async () => {
     const fake = new FakeBetfair();
     setStartTime(fake, PAST_START);
     const { contexts, state, markets } = setup(fake);
@@ -930,7 +930,7 @@ describe("review: feedback results", () => {
     state.setDataContext(WIN_MARKET, "EVAnalysis", { pick: "101" });
     fake.settle([101], WIN_MARKET, { bsp: { 101: 3.4, 102: 7.2, 103: 5 } });
     await markets.getBooks(markets.monitoredMarketIds()); // the recorder's poll (no SP) archives the market
-    assert.equal(state.archive.get(WIN_MARKET)?.runners[0].bsp, undefined);
+    assert.equal(state.archive.get(WIN_MARKET)?.runners[0].bsp, 3.4, "MarketService fetches SP_TRADED when archiving");
 
     const [entry] = await contexts.feedback("EVAnalysis", 10);
     assert.deepEqual(entry.result!.runners.map((r) => r.bsp), [3.4, 7.2, 5]);
@@ -951,7 +951,7 @@ describe("review: feedback results", () => {
     assert.equal(entry.market.settled, false);
   });
 
-  test("race info fills pastRaces[].price for a race archived from a poll without SP", async () => {
+  test("race info has pastRaces[].price for a race archived from a poll without SP", async () => {
     const fake = new FakeBetfair();
     const PAST = "1.200000009";
     fake.catalogues.set(PAST, { ...structuredClone(fake.catalogues.get(WIN_MARKET)!), marketId: PAST, marketName: "1m Hcap", marketStartTime: PAST_START });
@@ -959,8 +959,8 @@ describe("review: feedback results", () => {
     const { contexts, markets, state } = setup(fake);
     await markets.openMarket(PAST);
     fake.settle([102], PAST, { bsp: { 101: 4.1, 102: 6.2, 103: 9 } });
-    await markets.getBooks(markets.monitoredMarketIds()); // the recorder's poll archives it without BSPs
-    assert.equal(state.archive.get(PAST)?.runners[1].bsp, undefined);
+    await markets.getBooks(markets.monitoredMarketIds()); // the recorder's poll archives it, fetching BSPs separately
+    assert.equal(state.archive.get(PAST)?.runners[1].bsp, 6.2);
     const env = await contexts.getForMarket(WIN_MARKET, ["HorsesBetfairRaceInfoData"]);
     assert.equal(dataOf(env, "102").horseDetail.pastRaces[0].price, 6.2);
     assert.equal(dataOf(env, "101").horseDetail.pastRaces[0].price, 4.1);

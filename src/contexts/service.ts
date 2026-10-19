@@ -354,45 +354,7 @@ export class DataContextService implements DataContextApi {
   }
 
   private archiveResult(book: MarketBook) {
-    const bsp = new Map(book.runners.map((r) => [formatSelectionId(r.selectionId, r.handicap), finite(r.sp?.actualSP)]));
-    const existing = this.state.archive.get(book.marketId);
-    if (existing) {
-      if ([...bsp.values()].every((v) => v === undefined)) return;
-      const runners = existing.runners.map((r) => ({ ...r, bsp: r.bsp ?? bsp.get(formatSelectionId(r.selectionId, r.handicap)) }));
-      this.state.archiveMarket({ ...existing, runners });
-      return;
-    }
-    const catalogue = this.markets.cachedCatalogue(book.marketId);
-    const names = new Map((catalogue?.runners ?? []).map((r) => [formatSelectionId(r.selectionId, r.handicap), r]));
-    const rec = this.markets.recorder.get(book.marketId);
-    this.state.archiveMarket({
-      marketId: book.marketId,
-      marketName: catalogue?.marketName ?? book.marketId,
-      eventId: catalogue?.event?.id || undefined,
-      eventName: catalogue?.event?.name || undefined,
-      venue: catalogue?.event?.venue,
-      countryCode: catalogue?.event?.countryCode,
-      eventType: catalogue?.eventType?.name,
-      marketType: catalogue?.description?.marketType,
-      startTime: catalogue?.marketStartTime,
-      settledAt: new Date().toISOString(),
-      numberOfWinners: book.numberOfWinners,
-      runners: book.runners.map((r) => {
-        const key = formatSelectionId(r.selectionId, r.handicap);
-        const sel = rec?.selections.get(key);
-        return {
-          selectionId: r.selectionId,
-          handicap: r.handicap,
-          name: names.get(key)?.runnerName ?? key,
-          status: runnerStatusName(r.status) ?? r.status,
-          sortPriority: names.get(key)?.sortPriority,
-          bsp: bsp.get(key),
-          inPlayMin: sel?.inPlayMin,
-          inPlayMax: sel?.inPlayMax,
-          lastPriceTraded: r.lastPriceTraded,
-        };
-      }),
-    });
+    this.markets.archiveSettled(book);
   }
 
   private feedbackEntry(marketId: string, stored: StoredDataContext): FeedbackEntry {

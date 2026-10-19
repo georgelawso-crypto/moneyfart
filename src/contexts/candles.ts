@@ -78,6 +78,12 @@ export interface SideVolume {
 }
 
 /** Volume and Σ price·size of back-initiated and lay-initiated trades (unclassified trades are ignored). */
+/** Back/lay volumes since monitoring began, from the recorder's running totals (not limited to the retained trades). */
+export function recordedSideVolumes(sel: SelectionRecording | undefined): { back: SideVolume; lay: SideVolume } {
+  if (!sel) return { back: { volume: 0, notional: 0 }, lay: { volume: 0, notional: 0 } };
+  return { back: { ...sel.totals.back }, lay: { ...sel.totals.lay } };
+}
+
 export function sideVolumes(trades: Trade[] | undefined): { back: SideVolume; lay: SideVolume } {
   const back = { volume: 0, notional: 0 };
   const lay = { volume: 0, notional: 0 };

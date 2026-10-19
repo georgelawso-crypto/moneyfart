@@ -113,6 +113,24 @@ describe("recorder", () => {
     assert.deepEqual(recorder.get(WIN_MARKET)!.preOffOrder, ["101", "103", "102"]);
   });
 
+  test("running totals survive trimming of the trade list", async () => {
+    const fake = new FakeBetfair();
+    const recorder = new Recorder(10, 2);
+    const markets = new MarketService(fake, new State(), recorder, 20);
+    await markets.getBook(WIN_MARKET);
+    for (const [price, size] of [[3.0, 10], [3.05, 20], [2.98, 30]] as const) {
+      fake.trade(101, price, size);
+      await markets.getBook(WIN_MARKET);
+    }
+    const sel = recorder.get(WIN_MARKET)!.selections.get("101")!;
+    assert.equal(sel.trades.length, 2);
+    assert.equal(sel.totals.volume, 60);
+    assert.equal(sel.totals.back.volume, 40);
+    assert.equal(sel.totals.lay.volume, 20);
+    assert.equal(sel.totals.minPrice, 2.98);
+    assert.equal(sel.totals.maxPrice, 3.05);
+  });
+
   test("tracks in-play price range", async () => {
     const { fake, markets, recorder } = setup();
     await markets.getBook(WIN_MARKET);
@@ -166,6 +184,29 @@ describe("market service", () => {
     assert.deepEqual(market.selections.map((s) => s.selectionId), ["101", "103", "102"]);
     assert.equal(market.inPlay, true);
     assert.equal(markets.bfexplorerMarket(catalogue, fake.book(), true).inPlay, undefined);
+  });
+
+  test("archives BSPs even when the closing book was polled without SP", async () => {
+    const { fake, markets, state } = setup();
+    await markets.openMarket(WIN_MARKET);
+    fake.settle([101], WIN_MARKET, { bsp: { 101: 3.4, 102: 7.2, 103: 5 } });
+    await markets.getBooks([WIN_MARKET], { depth: 1 });
+    assert.deepEqual(state.archive.get(WIN_MARKET)!.runners.map((r) => r.bsp), [3.4, 7.2, 5]);
+  });
+
+  test("monitored-list eviction drops closed markets and companions before live primaries", async () => {
+    const fake = new FakeBetfair();
+    const state = new State();
+    const markets = new MarketService(fake, state, new Recorder(), 2);
+    const third = "1.200000003";
+    fake.catalogues.set(third, { ...structuredClone(fake.catalogues.get(WIN_MARKET)!), marketId: third });
+    fake.books.set(third, { ...structuredClone(fake.book(WIN_MARKET)), marketId: third });
+    await markets.openMarket(WIN_MARKET);
+    await markets.openMarket(PLACE_MARKET, { companionOf: WIN_MARKET });
+    await markets.openMarket(third); // evicts the companion, not the primary WIN market
+    assert.deepEqual([...state.monitored.keys()].sort(), [WIN_MARKET, third].sort());
+    await markets.openMarket(PLACE_MARKET, { companionOf: WIN_MARKET }); // a companion never evicts a primary
+    assert.equal(state.monitored.size, 3);
   });
 
   test("finds the sibling PLACE market of a WIN market", async () => {

@@ -17,6 +17,15 @@ export interface Trade {
   inPlay: boolean;
 }
 
+/** Aggregates over every trade recorded since monitoring began (not trimmed like `trades`). */
+export interface TradeTotals {
+  volume: number;
+  back: { volume: number; notional: number };
+  lay: { volume: number; notional: number };
+  minPrice?: number;
+  maxPrice?: number;
+}
+
 export interface SelectionRecording {
   /** Formatted selection id. */
   key: string;
@@ -31,8 +40,9 @@ export interface SelectionRecording {
   status?: string;
   /** Last EX_TRADED ladder seen (price -> cumulative size). */
   traded?: Map<number, number>;
-  /** Trades reconstructed from traded-volume growth between polls, oldest first. */
+  /** Trades reconstructed from traded-volume growth between polls, oldest first (the newest maxTradesPerSelection). */
   trades: Trade[];
+  totals: TradeTotals;
   /** Last-traded-price changes [time, price], oldest first (works without volume data). */
   prices: Array<[number, number]>;
   inPlayMin?: number;
@@ -130,6 +140,7 @@ export class Recorder {
         startPrice: runner.lastPriceTraded,
         startMatched: runner.totalMatched,
         trades: [],
+        totals: { volume: 0, back: { volume: 0, notional: 0 }, lay: { volume: 0, notional: 0 } },
         prices: runner.lastPriceTraded ? [[now, runner.lastPriceTraded]] : [],
         traded: ladder,
       };
@@ -169,6 +180,16 @@ export class Recorder {
     // Order within one poll is unknown; put the print furthest from the new LTP first so the last trade is the LTP.
     if (ltp !== undefined) fresh.sort((a, b) => Math.abs(b.price - ltp) - Math.abs(a.price - ltp));
     sel.trades.push(...fresh);
+    const totals = sel.totals;
+    for (const trade of fresh) {
+      totals.volume += trade.size;
+      if (trade.side !== "unknown") {
+        totals[trade.side].volume += trade.size;
+        totals[trade.side].notional += trade.size * trade.price;
+      }
+      totals.minPrice = Math.min(totals.minPrice ?? Infinity, trade.price);
+      totals.maxPrice = Math.max(totals.maxPrice ?? 0, trade.price);
+    }
     if (sel.trades.length > this.maxTradesPerSelection) sel.trades.splice(0, sel.trades.length - this.maxTradesPerSelection);
     if (inPlay) {
       for (const trade of fresh) {

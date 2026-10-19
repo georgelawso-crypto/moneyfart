@@ -12,7 +12,7 @@ import {
   METRIC_COUNT,
   METRIC_WINDOW_MS,
   recordedPoints,
-  sideVolumes,
+  recordedSideVolumes,
   sumSizes,
 } from "./candles.js";
 import { forecastPrice, genderName, metaNumber, metaNumberOrText, metaText, raceDistanceYards, weightLbs } from "./racing.js";
@@ -127,7 +127,7 @@ const candleStick: Provider = {
     return perSelection(ctx, (rc) => {
       const sel = ctx.selection(rc);
       const windows = anchoredWindows(recordedPoints(sel, ctx.volumeData), CANDLE_WINDOW_MS).slice(-CANDLE_COUNT);
-      const { back, lay } = sideVolumes(sel?.trades);
+      const { back, lay } = recordedSideVolumes(sel);
       const classified = back.volume + lay.volume;
       return {
         candleStickData: windows.length
@@ -174,9 +174,11 @@ const tradedPrices: Provider = {
       const sel = ctx.selection(rc);
       const startPrice = sel?.startPrice;
       const endPrice = ctx.runner(rc)?.lastPriceTraded ?? sel?.lastPrice;
-      const window = extremes([...recordedPoints(sel, ctx.volumeData).map((p) => p.price), startPrice, endPrice].filter(isPrice));
+      const window = extremes(
+        [...recordedPoints(sel, ctx.volumeData).map((p) => p.price), sel?.totals.minPrice, sel?.totals.maxPrice, startPrice, endPrice].filter(isPrice),
+      );
       if (!window) return undefined;
-      const { back, lay } = sideVolumes(sel?.trades);
+      const { back, lay } = recordedSideVolumes(sel);
       const classified = back.volume + lay.volume;
       const ratios = ctx.volumeData && classified > 0;
       return {
@@ -185,7 +187,7 @@ const tradedPrices: Provider = {
           endPrice,
           minPrice: window.min,
           maxPrice: window.max,
-          tradedVolume: ctx.volumeData ? (round(sumSizes(sel?.trades)) ?? 0) : undefined,
+          tradedVolume: ctx.volumeData ? (round(sel?.totals.volume) ?? 0) : undefined,
           backRatio: ratios ? back.volume / classified : undefined,
           layRatio: ratios ? lay.volume / classified : undefined,
         },
@@ -235,7 +237,7 @@ const weightOfMoney: Provider = {
       const toBack = runner?.ex?.availableToBack ?? [];
       const toLay = runner?.ex?.availableToLay ?? [];
       const traded = (runner?.ex?.tradedVolume ?? []).filter((l) => l.size > 0).sort((a, b) => a.price - b.price);
-      const { back, lay } = sideVolumes(ctx.volumeData ? ctx.selection(rc)?.trades : undefined);
+      const { back, lay } = recordedSideVolumes(ctx.volumeData ? ctx.selection(rc) : undefined);
       const backers = sumSizes(toLay);
       const layers = sumSizes(toBack);
       const nearBackers = sumSizes(toLay.slice(0, 5));
@@ -505,12 +507,8 @@ export function findProvider(name: string): Provider | undefined {
 }
 
 /** BFExplorer providers missing from BFEXPLORER_ONLY_CONTEXTS (listed in BFExplorer's provider reference). */
-const EXTRA_BFEXPLORER_ONLY: typeof BFEXPLORER_ONLY_CONTEXTS = {
-  PlayingFootballMatchScoresData: { source: "live football scores" },
-};
-
 /** BFExplorer-only providers (third-party feeds), excluding the ones implemented here. */
-export const UNAVAILABLE_PROVIDERS = Object.entries({ ...BFEXPLORER_ONLY_CONTEXTS, ...EXTRA_BFEXPLORER_ONLY })
+export const UNAVAILABLE_PROVIDERS = Object.entries(BFEXPLORER_ONLY_CONTEXTS)
   .filter(([name]) => !PROVIDER_BY_NAME.has(name.toLowerCase()))
   .map(([name, info]) => ({ name, ...info }));
 

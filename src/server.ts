@@ -923,7 +923,7 @@ function totals(settled: { bets: SettledBetView[]; commission?: number; truncate
       bets: settled.bets.length,
       won: settled.bets.filter((b) => b.outcome === "WON").length,
       grossProfit: round(gross),
-      commission: settled.commission,
+      commission: round(settled.commission),
       netProfit: settled.commission !== undefined ? round(gross - settled.commission) : undefined,
       truncated: settled.truncated,
     },

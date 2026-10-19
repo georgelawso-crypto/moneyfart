@@ -27,5 +27,6 @@ export const BFEXPLORER_ONLY_CONTEXTS: Record<string, { source: string; dataKeys
   HorsesNigelsRaceJockeyHeatmap: { source: "Nigel's jockey heatmap", dataKeys: ["nigelRaceJockeyHeatmap"] },
   TestRaceData: { source: "BFExplorer test race data", dataKeys: ["horseData"] },
   FootballMatchScoreData: { source: "live football scores" },
+  PlayingFootballMatchScoresData: { source: "live football scores" },
   PlayingTennisMatchScoresData: { source: "live tennis scores" },
 };
