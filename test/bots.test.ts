@@ -664,6 +664,21 @@ describe("bot runner", () => {
     await assert.rejects(() => g.bots.stop("bot-nope"), /Bot "bot-nope" not found/);
   });
 
+  test("stop with closePosition reports a position it could not close", async () => {
+    const f = setup();
+    const { bot } = await started(f, "Trade x profit");
+    f.fake.setOffers(101, [[3, 100]], []);
+    await assert.rejects(() => f.bots.stop(bot().id, { closePosition: true }), /is stopped, but its position was not closed: No lay price/);
+    assert.equal(bot().status, "stopped");
+    assert.equal(f.exchange.placed.length, 1);
+
+    const g = setup();
+    const other = await started(g, "Trade x profit");
+    g.fake.book().status = "SUSPENDED";
+    await assert.rejects(() => g.bots.stop(other.bot().id, { closePosition: true }), /position was not closed: the market is Suspended/);
+    assert.equal(other.bot().status, "stopped");
+  });
+
   test("stop cancels the bot's resting closing bet; stopAll stops every running bot", async () => {
     const f = setup();
     f.exchange.fill = (o) => (o.reducesRisk ? 0 : 1);
@@ -681,16 +696,36 @@ describe("bot runner", () => {
 
   test("a bot failing 5 ticks in a row becomes failed; a good tick resets the count", async () => {
     const f = setup();
+    f.exchange.fill = (o) => (o.reducesRisk ? 0 : 1);
     const { bot } = await started(f, "Trade x profit");
-    f.exchange.failCurrentOrders = 4;
+    f.fake.setOffers(101, [[2.58, 100]], [[2.6, 100]]);
+    f.exchange.failNext = Array(4).fill("ERROR_IN_MATCHER");
     for (let i = 0; i < 4; i++) await f.bots.tick();
     assert.equal(bot().status, "running");
-    await f.bots.tick();
+    assert.equal(bot().meta!.failures, 4);
+    await f.bots.tick(); // the closing bet is placed (and rests)
+    assert.equal(bot().status, "running");
     assert.equal(bot().meta!.failures, 0);
-    f.exchange.failCurrentOrders = 5;
-    for (let i = 0; i < 5; i++) await assert.doesNotReject(() => f.bots.tick());
+    f.exchange.failNext = Array(5).fill("ERROR_IN_MATCHER");
+    for (let i = 0; i < 5; i++) {
+      f.clock.t += 6000; // past BetMatchingTimeout: re-price
+      await assert.doesNotReject(() => f.bots.tick());
+    }
     assert.equal(bot().status, "failed");
-    assert.match(logText(bot()), /Error \(5\/5\): Betfair is unavailable[\s\S]*Failed 5 ticks in a row/);
+    assert.match(logText(bot()), /Error \(5\/5\): Closing bet LAY .* failed \(ERROR_IN_MATCHER\)[\s\S]*Failed 5 ticks in a row/);
+  });
+
+  test("Betfair being unreachable does not fail the bots: they wait and act once it is back", async () => {
+    const f = setup();
+    const { bot } = await started(f, "Trade x profit");
+    f.exchange.failCurrentOrders = 8;
+    for (let i = 0; i < 8; i++) await assert.doesNotReject(() => f.bots.tick());
+    assert.equal(bot().status, "running", logText(bot()));
+    assert.equal(bot().log.filter((l) => /Betfair is unavailable/.test(l.message)).length, 1, "logged once");
+    f.fake.setOffers(101, [[2.58, 100]], [[2.6, 100]]);
+    await f.bots.tick();
+    assert.equal(bot().status, "finished", logText(bot()));
+    assert.deepEqual(f.exchange.sent(1).map((o) => [o.side, o.price, o.size]), [["LAY", 2.6, 11.54]]);
   });
 
   test("a bot with unreadable persisted state fails without stopping the others", async () => {

@@ -163,13 +163,19 @@ export class BotRunner {
         metaOf(bot).phase = "done";
         this.log(bot, options.closePosition ? "Stopped by request; closing the position." : "Stopped by request; the position (if any) stays open.");
       }
+      let notClosed: string | undefined;
       try {
-        if (options.closePosition) await this.closeNow(bot);
+        if (options.closePosition) notClosed = await this.closeNow(bot);
         else if (wasRunning) await this.cancelRestingCloses(bot);
       } catch (error) {
         this.log(bot, `Could not ${options.closePosition ? "close the position" : "cancel the bot's closing bets"}: ${(error as Error).message}`);
+        if (options.closePosition) notClosed = (error as Error).message;
       }
       this.deps.state.changed();
+      if (notClosed) {
+        // A stopped bot no longer manages the position, so the caller must know it is still open.
+        throw new Error(`Bot ${bot.id} is stopped, but its position was not closed: ${notClosed} Check get_current_orders and close it (e.g. Close Selection Bet Position).`);
+      }
       return structuredClone(bot);
     });
   }
@@ -244,8 +250,14 @@ export class BotRunner {
         this.deps.state.changed();
         continue;
       }
+      if (fetchError) {
+        // Betfair (or the network) being unreachable is not the bot failing: giving up would leave its
+        // position unmanaged (e.g. no close before the off), so it retries on the next tick.
+        this.note(bot, `Could not read the market or orders (${fetchError.message}); retrying on the next tick.`);
+        this.deps.state.changed();
+        continue;
+      }
       try {
-        if (fetchError) throw fetchError;
         await this.evaluate(bot, views.get(bot.marketId)!);
         if (bot.status === "running") metaOf(bot).failures = 0;
       } catch (error) {
@@ -585,8 +597,8 @@ export class BotRunner {
     return {};
   }
 
-  /** stop(closePosition): one closing attempt, no re-pricing afterwards. */
-  private async closeNow(bot: BotState) {
+  /** stop(closePosition): one closing attempt, no re-pricing afterwards. Returns why nothing closed the position. */
+  private async closeNow(bot: BotState): Promise<string | undefined> {
     const m = metaOf(bot);
     const book = await this.deps.markets.getBook(bot.marketId, { depth: 1 });
     if (book.status !== "OPEN") throw new Error(`the market is ${marketStatusName(book.status)}`);
@@ -600,8 +612,11 @@ export class BotRunner {
       dirty: false,
     };
     m.closeReason = "stopped by request";
+    const placed = m.closeBetIds.length;
     const step = await this.closeStep(bot, m, view, runner, true);
     this.log(bot, step.message ?? "Closing bet placed; the bot is stopped, so it will not be re-priced if it does not match.");
+    if (step.done === "failed" || (!step.done && m.closeBetIds.length === placed)) return step.message ?? "no closing bet was placed.";
+    return undefined;
   }
 
   private async cancelRestingCloses(bot: BotState) {

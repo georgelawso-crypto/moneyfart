@@ -70,6 +70,8 @@ class Run {
   done = 0;
   /** Bets whose outcome is unknown (request timed out). */
   uncertain = 0;
+  /** Positions that needed closing but were not closed (cancelling bets alone is no success then). */
+  unclosed = 0;
   /** Sequence Execution: message of the step that failed (status false even after earlier bets). */
   failedStep?: string;
 
@@ -136,7 +138,8 @@ class Run {
       r.botIds = [...this.botIds];
     }
     if (this.rejected.length) r.rejected = this.rejected;
-    const acted = this.done + this.botIds.length;
+    const placed = r.bets.filter((b) => b.status === "SUCCESS").length;
+    const acted = this.unclosed && !placed ? this.botIds.length : this.done + this.botIds.length;
     if (this.failedStep !== undefined) {
       r.outcome = acted || this.uncertain ? "PartiallyExecuted" : "Failed";
       r.status = false;
@@ -150,7 +153,6 @@ class Run {
     if (r.outcome === "Failed") r.message = this.problems.join(" ");
     else if (r.outcome === "Skipped") r.message = this.skips.join(" ") || r.messages.join(" ") || "Nothing to do.";
     else if (r.outcome === "PartiallyExecuted") {
-      const placed = r.bets.filter((b) => b.status === "SUCCESS").length;
       const cancelled = r.cancelled.filter((c) => c.status === "SUCCESS").length;
       const unknown = this.uncertain ? ` ${this.uncertain} bet(s) have an unknown outcome: check get_current_orders before retrying.` : "";
       r.message =
@@ -823,6 +825,7 @@ export class StrategyEngine {
       hedged = placements.filter((p) => p.bet?.status === "SUCCESS").length;
       failed += placements.filter((p) => !p.bet || p.bet.status === "FAILURE").length;
     }
+    run.unclosed += failed;
     if (!needed) {
       if (!wanted) run.skip("No open matched position in this market; nothing to close.");
     } else if (!wanted || wanted.size > 1) {

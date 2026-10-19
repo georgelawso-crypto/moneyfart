@@ -851,6 +851,24 @@ describe("closing positions", () => {
     assert.ok(!result.messages.some((m) => /No open matched position/.test(m)));
   });
 
+  test("cancelling unmatched bets without closing the position is Failed, not PartiallyExecuted", async () => {
+    const { fake, engine, exchange } = setup();
+    await manual(exchange, "BACK", 5.9, 10, 102);
+    await manual(exchange, "BACK", 6.2, 5, 102, 0); // resting
+    fake.setOffers(102, [[5.9, 100]], []);
+    const result = await engine.execute("Close Selection Bet Position", W, [sel(102)]);
+    assert.equal(result.cancelled[0].status, "SUCCESS");
+    assert.equal(result.status, false, explain(result));
+    assert.equal(result.outcome, "Failed");
+    assert.match(result.message!, /could not be priced.*was not closed/);
+    // Only cancelling (nothing left to hedge) is still a success.
+    const only = setup();
+    await manual(only.exchange, "BACK", 6.2, 5, 102, 0);
+    const cancelled = await only.engine.execute("Close Selection Bet Position", W, [sel(102)]);
+    assert.equal(cancelled.status, true, explain(cancelled));
+    assert.equal(cancelled.outcome, "Executed");
+  });
+
   test("Close Market counts positions needing a hedge, hedged and failed", async () => {
     const { fake, engine, exchange } = setup();
     await manual(exchange, "BACK", 3, 10, 101);
