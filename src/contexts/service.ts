@@ -1,9 +1,9 @@
-import type { MarketBook, MarketCatalogue, Runner, RunnerCatalog } from "../betfair/types.js";
-import { assertMarketId, compact, formatSelectionId, localTime, marketStatusName, round, type SelectionRef } from "../format.js";
+import type { MarketBook, MarketCatalogue, PriceData, Runner, RunnerCatalog } from "../betfair/types.js";
+import { assertMarketId, compact, formatSelectionId, localTime, marketStatusName, round, runnerStatusName, type SelectionRef } from "../format.js";
 import type { MarketService } from "../markets.js";
 import type { MarketRecording } from "../recorder.js";
 import type { State, StoredDataContext } from "../state.js";
-import { findProvider, findUnavailableProvider, PROVIDERS, UNAVAILABLE_PROVIDERS, type BuildContext, type Provider } from "./providers.js";
+import { findProvider, findUnavailableProvider, finite, PROVIDERS, UNAVAILABLE_PROVIDERS, type BuildContext, type Provider } from "./providers.js";
 import type { DataContextApi, DataContextEnvelope, DataContextMarket, FeedbackEntry, ProviderInfo } from "./types.js";
 
 export interface ContextOptions {
@@ -17,6 +17,11 @@ const SHORT_HISTORY_MINUTES = 60;
 const MAX_FEEDBACK = 1000;
 const DEFAULT_FEEDBACK = 100;
 const MAX_CACHED_PLACE_MARKETS = 1000;
+/** Result lookups for feedback: SP_TRADED weighs 7, so 25 markets stay under Betfair's 200 per request. */
+const RESULT_BATCH = 25;
+/** A market still open at a result lookup is asked again after this long. */
+const RESULT_RETRY_MS = 5 * 60_000;
+const RESULT_PROJECTION = { priceData: ["SP_TRADED"] as PriceData[] };
 
 type Step = { name: string; provider: Provider } | { name: string; stored: StoredDataContext } | { name: string; reason: string };
 
@@ -48,6 +53,8 @@ function hasOffers(book: MarketBook): boolean {
 export class DataContextService implements DataContextApi {
   /** WIN market id -> PLACE market id. */
   private readonly placeMarkets = new Map<string, string>();
+  /** marketId -> earliest time (ms) its result may be looked up again (Infinity once settled or purged). */
+  private readonly resultLookups = new Map<string, number>();
 
   constructor(
     protected readonly markets: MarketService,
@@ -116,7 +123,14 @@ export class DataContextService implements DataContextApi {
     const steps = requested.map((name) => this.resolve(id, name));
     const providers = steps.flatMap((s) => ("provider" in s ? [s.provider] : []));
 
-    const catalogue = await this.markets.getCatalogue(id);
+    let catalogue: MarketCatalogue;
+    try {
+      catalogue = await this.markets.getCatalogue(id);
+    } catch (error) {
+      // Stored AI-agent contexts outlive Betfair's catalogue of a settled market: still return them.
+      if (only || !steps.some((s) => "stored" in s)) throw error;
+      return this.storedOnly(id, steps, errorMessage(error));
+    }
     const runners = only
       ? [this.markets.findRunner(catalogue, only)]
       : (catalogue.runners ?? []).slice().sort((a, b) => a.sortPriority - b.sortPriority);
@@ -163,6 +177,7 @@ export class DataContextService implements DataContextApi {
       markets: this.markets,
       state: this.state,
       placeMarketId: () => this.placeMarketId(catalogue),
+      refreshResults: (marketIds) => this.refreshResults(marketIds),
     };
 
     const selectionData = new Map(runners.map((rc) => [formatSelectionId(rc.selectionId, rc.handicap), {} as Record<string, unknown>]));
@@ -210,6 +225,20 @@ export class DataContextService implements DataContextApi {
     if (Object.keys(unavailable).length) envelope.unavailableDataContexts = unavailable;
     if (Object.keys(partial).length) envelope.partialDataContexts = partial;
     if (providers.some((p) => p.history)) envelope.recording = this.recordingInfo(id, recording, volumeData, [...notes, ...providerNotes]);
+    return envelope;
+  }
+
+  /** Envelope for a market Betfair no longer describes: stored contexts only, providers report why. */
+  private storedOnly(marketId: string, steps: Step[], catalogueError: string): DataContextEnvelope {
+    const data: Record<string, unknown> = {};
+    const unavailable: Record<string, string> = {};
+    for (const step of steps) {
+      if ("stored" in step) data[step.name] = step.stored.data;
+      else if ("reason" in step) unavailable[step.name] = step.reason;
+      else unavailable[step.name] = `${catalogueError} Continue the analysis without it.`;
+    }
+    const envelope: DataContextEnvelope = { market: this.header(undefined, marketId, this.knownStatus(marketId)), selectionsData: [], data };
+    if (Object.keys(unavailable).length) envelope.unavailableDataContexts = unavailable;
     return envelope;
   }
 
@@ -281,7 +310,89 @@ export class DataContextService implements DataContextApi {
     }
     const storedAt = (s: StoredDataContext) => Date.parse(s.updatedAt) || 0;
     found.sort((a, b) => storedAt(b.stored) - storedAt(a.stored));
-    return found.slice(0, limit).map(({ marketId, stored }) => this.feedbackEntry(marketId, stored));
+    const latest = found.slice(0, limit);
+    await this.refreshResults([...new Set(latest.map((f) => f.marketId))]);
+    return latest.map(({ marketId, stored }) => this.feedbackEntry(marketId, stored));
+  }
+
+  private needsResult(marketId: string, now: number): boolean {
+    if ((this.resultLookups.get(marketId) ?? 0) > now) return false;
+    const settled = this.state.archive.get(marketId);
+    // MarketService archives BSPs only from books fetched with SP; a poll without it leaves them empty.
+    return !settled || settled.runners.every((r) => r.bsp === undefined);
+  }
+
+  /**
+   * Best effort: results (with BSP) of markets that settled while the connector was not polling
+   * them, read straight from the API so the recorder (and its live recordings) is untouched.
+   */
+  private async refreshResults(marketIds: string[]) {
+    const now = Date.now();
+    // An invalid id would make Betfair reject the whole batch.
+    const ids = marketIds.filter((id) => /^\d\.\d+$/.test(id) && this.needsResult(id, now));
+    for (let i = 0; i < ids.length; i += RESULT_BATCH) {
+      const batch = ids.slice(i, i + RESULT_BATCH);
+      try {
+        const books = await this.markets.api.listMarketBook({ marketIds: batch, priceProjection: RESULT_PROJECTION });
+        const returned = new Set(books.map((b) => b.marketId));
+        const missing = batch.filter((id) => !returned.has(id));
+        // Betfair leaves CLOSED markets out of a request that also holds OPEN ones.
+        if (missing.length && books.some((b) => b.status !== "CLOSED")) {
+          books.push(...(await this.markets.api.listMarketBook({ marketIds: missing, priceProjection: RESULT_PROJECTION })));
+        }
+        const byId = new Map(books.map((b) => [b.marketId, b]));
+        for (const id of batch) {
+          const book = byId.get(id);
+          const settled = book?.status === "CLOSED" && book.runners.every((r) => r.status !== "ACTIVE");
+          if (book && settled) this.archiveResult(book);
+          this.resultLookups.set(id, !book || settled ? Infinity : now + RESULT_RETRY_MS);
+        }
+      } catch {
+        // Results are optional: feedback still returns the stored contexts.
+      }
+    }
+  }
+
+  private archiveResult(book: MarketBook) {
+    const bsp = new Map(book.runners.map((r) => [formatSelectionId(r.selectionId, r.handicap), finite(r.sp?.actualSP)]));
+    const existing = this.state.archive.get(book.marketId);
+    if (existing) {
+      if ([...bsp.values()].every((v) => v === undefined)) return;
+      const runners = existing.runners.map((r) => ({ ...r, bsp: r.bsp ?? bsp.get(formatSelectionId(r.selectionId, r.handicap)) }));
+      this.state.archiveMarket({ ...existing, runners });
+      return;
+    }
+    const catalogue = this.markets.cachedCatalogue(book.marketId);
+    const names = new Map((catalogue?.runners ?? []).map((r) => [formatSelectionId(r.selectionId, r.handicap), r]));
+    const rec = this.markets.recorder.get(book.marketId);
+    this.state.archiveMarket({
+      marketId: book.marketId,
+      marketName: catalogue?.marketName ?? book.marketId,
+      eventId: catalogue?.event?.id || undefined,
+      eventName: catalogue?.event?.name || undefined,
+      venue: catalogue?.event?.venue,
+      countryCode: catalogue?.event?.countryCode,
+      eventType: catalogue?.eventType?.name,
+      marketType: catalogue?.description?.marketType,
+      startTime: catalogue?.marketStartTime,
+      settledAt: new Date().toISOString(),
+      numberOfWinners: book.numberOfWinners,
+      runners: book.runners.map((r) => {
+        const key = formatSelectionId(r.selectionId, r.handicap);
+        const sel = rec?.selections.get(key);
+        return {
+          selectionId: r.selectionId,
+          handicap: r.handicap,
+          name: names.get(key)?.runnerName ?? key,
+          status: runnerStatusName(r.status) ?? r.status,
+          sortPriority: names.get(key)?.sortPriority,
+          bsp: bsp.get(key),
+          inPlayMin: sel?.inPlayMin,
+          inPlayMax: sel?.inPlayMax,
+          lastPriceTraded: r.lastPriceTraded,
+        };
+      }),
+    });
   }
 
   private feedbackEntry(marketId: string, stored: StoredDataContext): FeedbackEntry {

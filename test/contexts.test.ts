@@ -626,6 +626,19 @@ describe("racing providers", () => {
     assert.equal(placeOpens.length, 1, "open_market is called once for the PLACE market");
   });
 
+  test("HorseRacingWinToBePlacedData on a settled race reads the PLACE book without monitoring it again", async () => {
+    const { contexts, markets, fake, state } = setup();
+    await markets.openMarket(WIN_MARKET);
+    await contexts.getForMarket(WIN_MARKET, ["HorseRacingWinToBePlacedData"]);
+    state.monitored.delete(PLACE_MARKET); // e.g. evicted by later open_market calls
+    fake.settle([101], WIN_MARKET);
+    fake.settle([101, 103], PLACE_MARKET);
+    const env = await contexts.getForMarket(WIN_MARKET, ["HorseRacingWinToBePlacedData"]);
+    assert.equal(state.monitored.has(PLACE_MARKET), false, "a closed market is not added back to the monitored list");
+    assert.equal(dataOf(env, "101").winToBePlacedData.currentPlacePrice, 1.01);
+    assert.equal((env.data as { placeMarket: { numberOfWinners: number } }).placeMarket.numberOfWinners, 2);
+  });
+
   test("HorseRacingWinToBePlacedData without a PLACE market, or on a non-WIN market, is unavailable", async () => {
     const fake = new FakeBetfair();
     fake.catalogues.delete(PLACE_MARKET);
@@ -824,5 +837,149 @@ describe("providers and feedback", () => {
     for (let i = 0; i < 1005; i++) state.setDataContext(`1.4${String(i).padStart(8, "0")}`, "Bulk", { i });
     assert.equal((await contexts.feedback("Bulk", 5000)).length, 1000);
     assert.equal((await contexts.feedback("Bulk", Number.NaN)).length, 100);
+  });
+});
+
+describe("review: degraded Betfair responses", () => {
+  test("stored AI contexts stay readable when Betfair no longer knows the market and nothing is cached", async () => {
+    const { contexts, state } = setup();
+    const GONE = "1.500000001";
+    state.setDataContext(GONE, "HorseRacingStrategyR1_Analysis", { pick: "7" });
+    const env = await contexts.getForMarket(GONE, ["HorseRacingStrategyR1_Analysis", "BetfairSpData", "RacingTvDataForHorses"]);
+    assert.deepEqual(Object.keys(env), ["market", "selectionsData", "data", "unavailableDataContexts"]);
+    assert.deepEqual(env.market, { marketId: GONE, marketName: GONE });
+    assert.deepEqual(env.selectionsData, []);
+    assert.deepEqual(env.data, { HorseRacingStrategyR1_Analysis: { pick: "7" } });
+    assert.match(env.unavailableDataContexts!.BetfairSpData, /was not found.*Continue the analysis without it/);
+    assert.match(env.unavailableDataContexts!.RacingTvDataForHorses, /BFExplorer only/);
+    // Without a stored context to return, or with a selection to resolve, the error still surfaces.
+    await assert.rejects(contexts.getForMarket(GONE, ["BetfairSpData"]), /was not found/);
+    await assert.rejects(contexts.getForMarket(GONE, ["HorseRacingStrategyR1_Analysis"], { selectionId: 1, handicap: 0 }), /was not found/);
+  });
+
+  test("without a market book, metadata providers still work and book providers say why", async () => {
+    class NoBooks extends FakeBetfair {
+      override async listMarketBook(args: Parameters<BetfairApi["listMarketBook"]>[0]) {
+        this.calls.push({ method: "listMarketBook", args });
+        return [];
+      }
+    }
+    const { contexts } = setup(new NoBooks());
+    const env = await contexts.getForMarket(WIN_MARKET, [
+      "HorsesBaseBetfairFormData",
+      "HorsesBetfairRaceInfoData",
+      "BetfairSpData",
+      "MarketSelectionsCandleStickData",
+    ]);
+    assert.equal(dataOf(env, "101").weight, 140);
+    assert.equal(dataOf(env, "101").horseDetail.gender, "Gelding");
+    assert.match(env.unavailableDataContexts!.BetfairSpData, /^Betfair returned no market book for 1\.200000001 \(No market book returned/);
+    assert.match(env.unavailableDataContexts!.MarketSelectionsCandleStickData, /no market book/);
+    assert.equal(env.market.status, undefined);
+    assert.deepEqual(env.recording, {
+      minutes: 0,
+      volumeDataAvailable: false,
+      note: "Nothing has been recorded for this market: open it with open_market so the connector records its trades.",
+    });
+  });
+});
+
+describe("review: feedback results", () => {
+  const PAST_START = "2026-10-01T13:00:00.000Z";
+
+  test("joins results (with BSP) for markets that settled while the connector was not watching, without recording them", async () => {
+    const fake = new FakeBetfair();
+    setStartTime(fake, PAST_START);
+    const { contexts, state, markets, recorder } = setup(fake);
+    await markets.getCatalogue(WIN_MARKET); // catalogue snapshot only: never opened, never polled
+    await markets.getCatalogue(PLACE_MARKET);
+    state.setDataContext(WIN_MARKET, "EVAnalysis", { pick: "101" });
+    state.setDataContext(PLACE_MARKET, "EVAnalysis", { pick: "102" });
+    fake.settle([102], WIN_MARKET, { bsp: { 101: 3.4, 102: 7.2, 103: 5 } });
+
+    const entries = await contexts.feedback("EVAnalysis", 10);
+    const win = entries.find((e) => e.market.marketId === WIN_MARKET)!;
+    assert.equal(win.market.settled, true);
+    assert.equal(win.market.status, "Closed");
+    assert.deepEqual(win.result!.runners, [
+      { selectionId: "101", name: "Fast Horse", status: "Loser", isWinner: false, bsp: 3.4 },
+      { selectionId: "102", name: "Slow Horse", status: "Winner", isWinner: true, bsp: 7.2 },
+      { selectionId: "103", name: "Mid Horse", status: "Loser", isWinner: false, bsp: 5 },
+    ]);
+    const place = entries.find((e) => e.market.marketId === PLACE_MARKET)!;
+    assert.equal(place.market.settled, false, "the still-open PLACE market is not settled");
+    assert.equal(state.archive.get(WIN_MARKET)?.marketType, "WIN", "the result is archived for race history");
+    assert.equal(recorder.get(WIN_MARKET), undefined, "result lookups do not evict live recordings");
+
+    // Betfair rule: a request mixing OPEN and CLOSED markets returns only the OPEN ones, so the missing one is asked again.
+    assert.equal(fake.calls.filter((c) => c.method === "listMarketBook").length, 2);
+    // Settled markets are not looked up again.
+    fake.calls = [];
+    await contexts.feedback("EVAnalysis", 10);
+    assert.equal(fake.calls.filter((c) => c.method === "listMarketBook" && c.args.marketIds.includes(WIN_MARKET)).length, 0);
+  });
+
+  test("fills in BSPs missing from a market archived from a book without SP", async () => {
+    const fake = new FakeBetfair();
+    setStartTime(fake, PAST_START);
+    const { contexts, state, markets } = setup(fake);
+    await markets.openMarket(WIN_MARKET);
+    fake.book().inplay = true;
+    fake.trade(101, 1.5, 20);
+    await markets.getBooks(markets.monitoredMarketIds());
+    state.setDataContext(WIN_MARKET, "EVAnalysis", { pick: "101" });
+    fake.settle([101], WIN_MARKET, { bsp: { 101: 3.4, 102: 7.2, 103: 5 } });
+    await markets.getBooks(markets.monitoredMarketIds()); // the recorder's poll (no SP) archives the market
+    assert.equal(state.archive.get(WIN_MARKET)?.runners[0].bsp, undefined);
+
+    const [entry] = await contexts.feedback("EVAnalysis", 10);
+    assert.deepEqual(entry.result!.runners.map((r) => r.bsp), [3.4, 7.2, 5]);
+    const archived = state.archive.get(WIN_MARKET)!.runners[0];
+    assert.equal(archived.bsp, 3.4, "the archive keeps the BSP for race history");
+    assert.equal(archived.inPlayMin, 1.01, "fields recorded at settlement are kept");
+  });
+
+  test("a Betfair failure while looking up results does not fail feedback", async () => {
+    class BooksFail extends FakeBetfair {
+      override async listMarketBook(): Promise<never> {
+        throw new Error("TOO_MUCH_DATA");
+      }
+    }
+    const { contexts, state } = setup(new BooksFail());
+    state.setDataContext(WIN_MARKET, "EVAnalysis", { pick: "101" });
+    const [entry] = await contexts.feedback("EVAnalysis", 10);
+    assert.equal(entry.market.settled, false);
+  });
+
+  test("race info fills pastRaces[].price for a race archived from a poll without SP", async () => {
+    const fake = new FakeBetfair();
+    const PAST = "1.200000009";
+    fake.catalogues.set(PAST, { ...structuredClone(fake.catalogues.get(WIN_MARKET)!), marketId: PAST, marketName: "1m Hcap", marketStartTime: PAST_START });
+    fake.books.set(PAST, { ...structuredClone(fake.book(WIN_MARKET)), marketId: PAST });
+    const { contexts, markets, state } = setup(fake);
+    await markets.openMarket(PAST);
+    fake.settle([102], PAST, { bsp: { 101: 4.1, 102: 6.2, 103: 9 } });
+    await markets.getBooks(markets.monitoredMarketIds()); // the recorder's poll archives it without BSPs
+    assert.equal(state.archive.get(PAST)?.runners[1].bsp, undefined);
+    const env = await contexts.getForMarket(WIN_MARKET, ["HorsesBetfairRaceInfoData"]);
+    assert.equal(dataOf(env, "102").horseDetail.pastRaces[0].price, 6.2);
+    assert.equal(dataOf(env, "101").horseDetail.pastRaces[0].price, 4.1);
+    fake.calls = [];
+    await contexts.getForMarket(WIN_MARKET, ["HorsesBetfairRaceInfoData"]);
+    assert.equal(fake.calls.filter((c) => c.method === "listMarketBook" && c.args.marketIds.includes(PAST)).length, 0, "looked up once");
+  });
+
+  test("ids that are not Betfair market ids are never sent with a result lookup", async () => {
+    const fake = new FakeBetfair();
+    setStartTime(fake, PAST_START);
+    const { contexts, state, markets } = setup(fake);
+    await markets.getCatalogue(WIN_MARKET);
+    state.setDataContext("not-a-market", "EVAnalysis", { pick: "x" });
+    state.setDataContext(WIN_MARKET, "EVAnalysis", { pick: "101" });
+    fake.settle([101], WIN_MARKET);
+    const entries = await contexts.feedback("EVAnalysis", 10);
+    assert.equal(entries.length, 2);
+    assert.equal(entries.find((e) => e.market.marketId === WIN_MARKET)!.market.settled, true);
+    for (const call of fake.calls.filter((c) => c.method === "listMarketBook")) assert.ok(!call.args.marketIds.includes("not-a-market"));
   });
 });

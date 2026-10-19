@@ -39,6 +39,8 @@ export interface BuildContext {
   state: State;
   /** The PLACE market of this (WIN) market, cached per WIN market. */
   placeMarketId(): Promise<string | undefined>;
+  /** Best effort: archive results (with BSP) of settled markets that are missing or archived without BSPs. */
+  refreshResults(marketIds: string[]): Promise<void>;
 }
 
 export interface ProviderOutput {
@@ -97,7 +99,7 @@ function marketToolPrice(runner: Runner): number {
 }
 
 /** Betfair sends "NaN"/"Infinity" for some SP projections. */
-function finite(value: unknown): number | undefined {
+export function finite(value: unknown): number | undefined {
   const n = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
   return Number.isFinite(n) ? n : undefined;
 }
@@ -386,7 +388,8 @@ const winToBePlaced: Provider = {
       return { selections: new Map(), noData: "No PLACE (To Be Placed) market was found for this race. Continue the analysis without it." };
     }
     let placeBook: MarketBook;
-    if (ctx.state.monitored.has(placeId)) placeBook = await ctx.markets.getBook(placeId);
+    // A settled race has nothing left to record: opening its PLACE market would only evict a live monitored market.
+    if (ctx.state.monitored.has(placeId) || ctx.book?.status === "CLOSED") placeBook = await ctx.markets.getBook(placeId);
     else {
       placeBook = (await ctx.markets.openMarket(placeId, { companionOf: ctx.marketId })).book;
       ctx.note(
@@ -461,7 +464,12 @@ const raceInfo: Provider = {
   dataKeys: ["horseDetail"],
   bookless: true,
   noData: NO_METADATA,
-  build(ctx) {
+  async build(ctx) {
+    const wanted = new Set(ctx.runners.map((rc) => rc.selectionId));
+    const ran = [...ctx.state.archive.values()].filter(
+      (m) => m.marketId !== ctx.marketId && m.marketType?.toUpperCase() === "WIN" && m.runners.some((r) => wanted.has(r.selectionId)),
+    );
+    await ctx.refreshResults(ran.map((m) => m.marketId)); // a race archived from a poll without SP has no BSP
     const past = pastRaces(ctx.state.archive, ctx.marketId);
     return perSelection(ctx, (rc) => {
       const m = rc.metadata;
