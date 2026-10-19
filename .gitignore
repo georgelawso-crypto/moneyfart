@@ -5,3 +5,4 @@ data/
 *.pem
 *.crt
 *.key
+.claude/
