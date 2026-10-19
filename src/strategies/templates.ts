@@ -82,8 +82,11 @@ const PLACE_BET: ParameterSpec[] = [
     type: "number",
     integer: true,
     default: 0,
+    min: -128,
+    max: 127,
     aliases: ["OddsOffsetTicks", "OddsImprovement"],
-    description: "Ask for a price this many ticks better (higher for a back, lower for a lay).",
+    description:
+      "Ticks to move the price (BFExplorer's signed tick count): positive = better (higher for a back, lower for a lay), may stay unmatched; negative = worse, so the bet matches more easily. Clamped to the ladder ends.",
   },
   {
     name: "OfferMyBet",
@@ -158,8 +161,8 @@ function closeParameters(immediate: boolean): ParameterSpec[] {
       type: "boolean",
       default: immediate,
       description: immediate
-        ? "true = close now; false = start a bot that closes on the Profit/Loss/time targets."
-        : "Close as soon as the entry is matched (no profit/loss targets).",
+        ? "Not given: close now when no Profit/Loss/ClosePositionTimeSpan target is set, otherwise start a bot that closes on the targets. true = close now (any targets are ignored); false = always start a bot that closes on the targets."
+        : "Close as soon as the entry is matched. Only applies when no Profit, Loss or ClosePositionTimeSpan target is set: with a target, the targets decide when to close.",
     },
   ];
 }
@@ -204,14 +207,14 @@ export const TEMPLATES: TemplateSpec[] = [
     aliases: ["Place Bet and Close Position"],
     category: "Trading",
     description:
-      "Trade: place the OpenBetPosition bet, then a bot closes the position (green-up) on the CloseBetPosition targets: profit/loss in Money, Ticks or Percentage of the opening risk, a time before the off, or immediately. Dotted keys such as OpenBetPosition.BetType and CloseBetPosition.Profit; plain names are accepted too.",
+      "Trade: place the OpenBetPosition bet, then a bot closes the position (green-up) on the CloseBetPosition targets: profit/loss in Money, Ticks or Percentage of the opening risk, a time before the off, or (ClosePositionImmediately, only when no target is set) as soon as the entry is matched. Dotted keys such as OpenBetPosition.BetType and CloseBetPosition.Profit; plain names are accepted too.",
     parameters: [...grouped(OPEN, PLACE_BET), ...grouped(CLOSE, closeParameters(false)), ...TOP_LEVEL_OF_TRADE],
   },
   {
     name: TEMPLATE.closeSelection,
     category: "Position",
     description:
-      "Close (green up) the selection's whole matched position: immediately (default), or with ClosePositionImmediately false by a bot on the Profit/Loss/time targets.",
+      "Close (green up) the selection's whole matched position: immediately (default without targets), or by a bot on the Profit/Loss/ClosePositionTimeSpan targets when any is given (unless ClosePositionImmediately is true) or ClosePositionImmediately is false.",
     parameters: [CANCEL_UNMATCHED, ...closeParameters(true), ...SELECTION, REFERENCE],
   },
   {
@@ -394,7 +397,10 @@ function parseValue(spec: ParameterSpec, raw: unknown): ParamValue {
   switch (spec.type) {
     case "number": {
       const n = typeof raw === "number" ? raw : typeof raw === "string" && DECIMAL.test(raw.trim()) ? Number(raw.trim()) : NaN;
-      if (!Number.isFinite(n) || n < 0) throw fail("a non-negative number");
+      const min = spec.min ?? 0;
+      if (!Number.isFinite(n) || n < min || (spec.max !== undefined && n > spec.max)) {
+        throw fail(spec.min === undefined && spec.max === undefined ? "a non-negative number" : `a number from ${min} to ${spec.max ?? "any"}`);
+      }
       if (spec.integer && !Number.isInteger(n)) throw fail("a whole number");
       return n;
     }
@@ -497,6 +503,14 @@ export function resolveParameters(template: TemplateSpec, ...layers: Params[]): 
   const values: Params = Object.fromEntries(template.parameters.map((p) => [p.name, p.default]));
   for (const layer of layers) Object.assign(values, layer);
   return values;
+}
+
+/**
+ * A Profit, Loss or ClosePositionTimeSpan target is set (close values without group prefix). With one,
+ * ClosePositionImmediately no longer means "close as soon as matched": the targets decide.
+ */
+export function hasCloseTargets(close: Params): boolean {
+  return Number(close.Profit ?? 0) > 0 || Number(close.Loss ?? 0) > 0 || timeSpanMs(close.ClosePositionTimeSpan) !== undefined;
 }
 
 /** Values of one parameter group with the prefix removed (plus the ungrouped top-level values). */

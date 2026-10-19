@@ -11,6 +11,8 @@ export interface OrderRequest {
   persistenceType: PersistenceType;
   /** Hedge/offset/close orders: exempt from MAX_STAKE/MAX_LIABILITY (never from Betfair's minimum bet rules). */
   reducesRisk?: boolean;
+  /** Caller-chosen Betfair customerOrderRef (at most 32 characters), so the order can be found again after a restart. */
+  customerOrderRef?: string;
 }
 
 /** Strategy attribution: `ref` is Betfair's customerStrategyRef (max 15 chars, unique per strategy name). */

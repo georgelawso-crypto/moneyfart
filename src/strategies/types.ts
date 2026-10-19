@@ -24,6 +24,10 @@ export interface ParameterSpec {
   required?: boolean;
   /** Whole numbers only (ticks, positions). */
   integer?: boolean;
+  /** Smallest accepted number (default 0: numbers are non-negative unless a spec says otherwise). */
+  min?: number;
+  /** Largest accepted number (default: no limit). */
+  max?: number;
   /** Other accepted values (lower case) mapped to the canonical one, e.g. PersistenceType "persist" -> true. */
   valueAliases?: Record<string, string | boolean>;
 }

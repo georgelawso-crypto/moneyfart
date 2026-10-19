@@ -380,6 +380,7 @@ export class PaperExchange implements Exchange {
       placedInPlay: Boolean(book.inplay),
       strategyName: strategy.name,
       strategyRef: strategy.ref,
+      customerOrderRef: req.customerOrderRef,
       marketName: catalogue.marketName,
       eventName: catalogue.event?.name,
       eventType: catalogue.eventType?.name,

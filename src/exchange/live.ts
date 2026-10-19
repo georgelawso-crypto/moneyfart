@@ -76,7 +76,8 @@ export class LiveExchange implements Exchange {
 
   /**
    * Places LIMIT orders. Every request carries a unique customerRef (Betfair de-duplicates
-   * resubmissions) and every instruction a unique customerOrderRef, so an answer lost to a
+   * resubmissions) and every instruction a unique customerOrderRef (the caller's own when
+   * OrderRequest.customerOrderRef is set), so an answer lost to a
    * timeout can be looked up: such orders are reported SUCCESS when found and UNKNOWN when
    * not, never FAILURE. Errors that prove nothing was sent are thrown when no request of this
    * call has been sent yet; later they become FAILURE results so placed bets are never hidden.
@@ -104,7 +105,7 @@ export class LiveExchange implements Exchange {
           handicap: order.handicap,
           side: order.side,
           limitOrder: { size, price, persistenceType: order.persistenceType },
-          customerOrderRef: `${refPrefix}-${index.toString(36)}`,
+          customerOrderRef: order.customerOrderRef ?? `${refPrefix}-${index.toString(36)}`,
         },
       });
     });

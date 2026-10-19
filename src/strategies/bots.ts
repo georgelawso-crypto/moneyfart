@@ -9,8 +9,8 @@ import { formatSelectionId, marketStatusName, round, runnerStatusName, type Sele
 import type { MarketService } from "../markets.js";
 import type { State } from "../state.js";
 import type { BotState } from "./botTypes.js";
-import { CLOSE, FILL_OR_KILL_MAX_MS, OPEN, groupValues, timeSpanMs, type Params } from "./templates.js";
-import { OrderDesk, bestPrices, cancelSucceeded, closeOrder, describePosition, isFlatAt, planEntry, runnerOf } from "./trading.js";
+import { CLOSE, FILL_OR_KILL_MAX_MS, OPEN, groupValues, hasCloseTargets, timeSpanMs, type Params } from "./templates.js";
+import { OrderDesk, bestPrices, cancelSucceeded, closeOrder, describePosition, isFlatAt, planEntry, runnerOf, type Placement, type PlannedOrder } from "./trading.js";
 
 export interface BotDeps {
   markets: MarketService;
@@ -27,6 +27,17 @@ export interface BotDeps {
  */
 export type BotKind = "place" | "fillOrKill" | "trade" | "close" | "trailing";
 export type BotPhase = "waiting" | "fillOrKill" | "open" | "monitoring" | "closing" | "done";
+
+/** An order sent by a bot whose result is not recorded yet (saved before the request is sent). */
+export interface PendingOrderRef {
+  /** Betfair customerOrderRef of the order. */
+  ref: string;
+  role: "entry" | "close";
+  /** Epoch ms at which the order was sent. */
+  at: number;
+  /** The market was in-play when the order was sent. */
+  inPlay?: boolean;
+}
 
 /** Typed content of BotState.meta (persisted with the bot, so JSON values only). */
 export interface BotMeta {
@@ -54,6 +65,11 @@ export interface BotMeta {
   hadPosition?: boolean;
   failures: number;
   lastNote?: string;
+  /**
+   * Orders sent but not yet recorded: saved before the request so that after a restart (or a request
+   * that threw) the bot finds the bet by customerOrderRef instead of placing it again.
+   */
+  pendingOrderRefs?: PendingOrderRef[];
 }
 
 export interface BotStart {
@@ -84,6 +100,8 @@ const MAX_LOG = 50;
 const MAX_FAILURES = 5;
 const KEEP_ENDED_BOTS = 200;
 const DEFAULT_MATCHING_TIMEOUT_MS = 5000;
+/** A pending order not found among the current orders this long after it was sent was not placed. */
+const PENDING_ORDER_MS = 120_000;
 
 const metaOf = (bot: BotState) => bot.meta as unknown as BotMeta;
 const sum = (values: number[]) => values.reduce((total, v) => total + v, 0);
@@ -270,6 +288,8 @@ export class BotRunner {
   private async evaluate(bot: BotState, view: MarketView) {
     const m = metaOf(bot);
     if (view.dirty) await this.refresh(view);
+    if (m.pendingOrderRefs?.length) this.reconcile(bot, m, view);
+    if (bot.status !== "running") return;
     const book = view.book;
     if (!book) return this.finish(bot, "finished", "The market is no longer available from Betfair (closed or purged); bot finished.");
     if (book.status === "CLOSED") return this.finish(bot, "finished", "Market closed; bot finished.");
@@ -279,6 +299,11 @@ export class BotRunner {
       return this.finish(bot, "finished", `The selection is ${runnerStatusName(runner.status)} (Betfair voids a non-runner's bets); bot finished.`);
     }
     if (book.status !== "OPEN") return this.note(bot, `Market is ${marketStatusName(book.status)}; waiting.`);
+    if (m.pendingOrderRefs?.length) {
+      // Nothing new is placed until every order sent earlier is found or known not to exist.
+      const refs = m.pendingOrderRefs.map((p) => `${p.role} ${p.ref}`).join(", ");
+      return this.note(bot, `Waiting to find the bet(s) sent before (${refs}) among the current orders before placing anything new.`);
+    }
     switch (m.phase) {
       case "waiting":
         return this.placeEntry(bot, m, view, runner);
@@ -325,8 +350,7 @@ export class BotRunner {
     if ("skip" in plan) return this.finish(bot, "finished", plan.skip);
     if ("problem" in plan) return this.finish(bot, "failed", plan.problem);
     const ref = { selectionId: bot.selectionId, handicap: bot.handicap };
-    const [placement] = await this.desk.place(bot.marketId, [{ ...ref, ...plan, role: "entry", selectionName: m.selectionName }], m.tag, view.rules, m.ladder);
-    view.dirty = true;
+    const placement = await this.placeTracked(bot, m, view, "entry", { ...ref, ...plan, role: "entry", selectionName: m.selectionName }, Boolean(book.inplay));
     if (placement.reason) return this.finish(bot, "failed", `${name}: ${placement.reason} Bet not placed.`);
     const bet = placement.bet!;
     if (bet.status === "UNKNOWN") {
@@ -335,13 +359,18 @@ export class BotRunner {
     if (bet.status !== "SUCCESS" || !bet.betId) return this.finish(bot, "failed", `The entry bet failed (${bet.errorCode ?? bet.status}).`);
     bot.betIds.push(bet.betId);
     m.entryBetIds.push(bet.betId);
-    m.placedInPlay = Boolean(book.inplay);
     this.log(bot, `Placed ${bet.side} ${bet.size} @ ${bet.price} (bet ${bet.betId}, matched ${round(bet.sizeMatched ?? 0)}).`);
+    this.entryPlaced(bot, m, bet.size, bet.sizeMatched ?? 0, now, Boolean(book.inplay));
+  }
+
+  /** The entry bet exists (placed now, or found after a restart): move on to the next phase. */
+  private entryPlaced(bot: BotState, m: BotMeta, size: number, sizeMatched: number, at: number, inPlay: boolean) {
+    m.placedInPlay = inPlay;
     if (m.kind === "place") return this.finish(bot, "finished", "Bet placed; bot finished.");
     if (m.kind === "fillOrKill") {
-      if ((bet.sizeMatched ?? 0) >= bet.size - 1e-9) return this.finish(bot, "finished", "Fill or kill: fully matched.");
+      if (sizeMatched >= size - 1e-9) return this.finish(bot, "finished", "Fill or kill: fully matched.");
       m.phase = "fillOrKill";
-      m.fillOrKillUntil = now + Math.min(timeSpanMs(open.BetMatchingTimeout) ?? DEFAULT_MATCHING_TIMEOUT_MS, FILL_OR_KILL_MAX_MS);
+      m.fillOrKillUntil = at + Math.min(timeSpanMs(this.entryParams(bot).BetMatchingTimeout) ?? DEFAULT_MATCHING_TIMEOUT_MS, FILL_OR_KILL_MAX_MS);
       return;
     }
     m.phase = "open";
@@ -440,7 +469,8 @@ export class BotRunner {
 
   private targetReason(m: BotMeta, close: Params, position: Position, runner: Runner, ref: { price?: number; risk?: number }): string | undefined {
     if (m.closeAt !== undefined && this.now() >= m.closeAt) return `close time reached (${close.ClosePositionTimeSpan} from the start)`;
-    if (close.ClosePositionImmediately === true) return "ClosePositionImmediately";
+    // With a Profit, Loss or time target the targets decide; ClosePositionImmediately applies only without them.
+    if (close.ClosePositionImmediately === true && !hasCloseTargets(close)) return "ClosePositionImmediately";
     const long = position.ifWin > position.ifLose;
     const best = bestPrices(runner);
     const price = close.CheckingLastPriceTraded === true ? runner.lastPriceTraded : long ? best.lay : best.back;
@@ -526,16 +556,36 @@ export class BotRunner {
     if (order.note) this.log(bot, `${order.note}.`);
     if (m.scope === "own") {
       // Closing bets are exempt from the limits because they reduce risk: never hedge the bot's part
-      // again when other bets (e.g. a manual Close Selection) already flattened or reversed the selection.
-      const selection = positionOf(view.orders.filter((o) => o.selectionId === key));
-      let whole: ReturnType<typeof closeOrder>;
-      try {
-        whole = closeOrder(selection, hedging, best.back, best.lay);
-      } catch {
-        whole = undefined;
-      }
+      // again when other bets (e.g. a manual Close Selection) already flattened or reversed the selection,
+      // or would once their unmatched hedge-side part matches.
+      const onSelection = view.orders.filter((o) => o.selectionId === key);
+      const selection = positionOf(onSelection);
+      const closing = (p: Position) => {
+        try {
+          return closeOrder(p, hedging, best.back, best.lay);
+        } catch {
+          return undefined;
+        }
+      };
+      let whole = closing(selection);
       if (!whole || whole.side !== order.side) {
         return { done: "finished", message: `Other bets already closed the selection's position (${describePosition(selection)}); not hedging this bot's part again.` };
+      }
+      const hedgeSide = order.side;
+      const pending = onSelection.filter((o) => o.sizeRemaining > 0 && o.side === hedgeSide);
+      if (pending.length) {
+        // Unmatched bets never finish the bot (they may be cancelled or lapse): wait while they would cover the
+        // position, and otherwise hedge only what they leave uncovered.
+        const ifMatched = pending.reduce((p, o) => addBet(p, o.side, o.price, o.sizeRemaining), selection);
+        const rest = closing(ifMatched);
+        if (!rest || rest.side !== hedgeSide) {
+          return {
+            message:
+              `Unmatched ${hedgeSide} bet(s) ${pending.map((o) => o.betId).join(", ")} on the selection would close its position when matched; ` +
+              "not hedging this bot's part while they rest (it hedges what is left open if they are cancelled or lapse).",
+          };
+        }
+        whole = rest;
       }
       if (whole.size < order.size) {
         this.log(bot, `Other bets on the selection already cover part of this position: hedging ${whole.size} instead of ${order.size}.`);
@@ -556,26 +606,24 @@ export class BotRunner {
         message: `The residual position (${describePosition(position)}) needs ${order.side} ${order.size} @ ${order.price}: ${tooSmall} Left open; bot finished.`,
       };
     }
-    const [placement] = await this.desk.place(
-      bot.marketId,
-      [
-        {
-          selectionId: bot.selectionId,
-          handicap: bot.handicap,
-          side: order.side,
-          price: order.price,
-          size: order.size,
-          persistenceType: "LAPSE",
-          reducesRisk: true,
-          role: "close",
-          selectionName: m.selectionName,
-        },
-      ],
-      m.tag,
-      view.rules,
-      m.ladder,
+    const placement = await this.placeTracked(
+      bot,
+      m,
+      view,
+      "close",
+      {
+        selectionId: bot.selectionId,
+        handicap: bot.handicap,
+        side: order.side,
+        price: order.price,
+        size: order.size,
+        persistenceType: "LAPSE",
+        reducesRisk: true,
+        role: "close",
+        selectionName: m.selectionName,
+      },
+      Boolean(view.book?.inplay),
     );
-    view.dirty = true;
     if (placement.reason) throw new Error(`Closing bet not sent: ${placement.reason}`);
     const bet = placement.bet!;
     if (bet.status === "UNKNOWN") {
@@ -611,6 +659,10 @@ export class BotRunner {
       rules: await this.deps.exchange.currencyRules(),
       dirty: false,
     };
+    if (m.pendingOrderRefs?.length) this.reconcile(bot, m, view);
+    if (m.pendingOrderRefs?.length) {
+      return `bet(s) sent earlier (${m.pendingOrderRefs.map((p) => `${p.role} ${p.ref}`).join(", ")}) are not among the current orders yet, so no closing bet was placed.`;
+    }
     m.closeReason = "stopped by request";
     const placed = m.closeBetIds.length;
     const step = await this.closeStep(bot, m, view, runner, true);
@@ -630,6 +682,55 @@ export class BotRunner {
   }
 
   // ---------------------------------------------------------------- helpers
+
+  /**
+   * Place one order of the bot with its intent saved first: the order's customerOrderRef is recorded in
+   * the bot and the state saved synchronously before the request, so a restart while it is in flight
+   * finds the bet (reconcile) instead of placing it again. The ref is cleared once the result is back.
+   */
+  private async placeTracked(bot: BotState, m: BotMeta, view: MarketView, role: PendingOrderRef["role"], order: PlannedOrder, inPlay: boolean): Promise<Placement> {
+    const ref = `${bot.id}-${role[0]}${crypto.randomBytes(6).toString("hex")}`;
+    m.pendingOrderRefs = [...(m.pendingOrderRefs ?? []), { ref, role, at: this.now(), inPlay }];
+    this.deps.state.changed();
+    this.deps.state.flush();
+    const [placement] = await this.desk.place(bot.marketId, [{ ...order, customerOrderRef: ref }], m.tag, view.rules, m.ladder);
+    // A request that threw keeps the ref pending: the next tick looks for the bet before placing anything.
+    const left = (m.pendingOrderRefs ?? []).filter((p) => p.ref !== ref);
+    m.pendingOrderRefs = left.length ? left : undefined;
+    view.dirty = true;
+    return placement;
+  }
+
+  /** Adopt pending orders found among the current orders (by customerOrderRef); drop those not found in time. */
+  private reconcile(bot: BotState, m: BotMeta, view: MarketView) {
+    const now = this.now();
+    const left: PendingOrderRef[] = [];
+    for (const p of m.pendingOrderRefs ?? []) {
+      const order = view.orders.find((o) => o.customerOrderRef === p.ref);
+      if (!order) {
+        if (now - p.at < PENDING_ORDER_MS) left.push(p);
+        else {
+          this.log(
+            bot,
+            `The ${p.role} bet sent at ${new Date(p.at).toISOString()} (customerOrderRef ${p.ref}) is not among the current orders after ${PENDING_ORDER_MS / 60_000} minutes: it was not placed; carrying on.`,
+          );
+        }
+        continue;
+      }
+      if (!bot.betIds.includes(order.betId)) bot.betIds.push(order.betId);
+      const what = `${order.side} ${order.size} @ ${order.price} (bet ${order.betId}, matched ${round(order.sizeMatched)})`;
+      if (p.role === "entry") {
+        if (!m.entryBetIds.includes(order.betId)) m.entryBetIds.push(order.betId);
+        this.log(bot, `Found the entry bet sent before (customerOrderRef ${p.ref}): ${what}.`);
+        if (m.phase === "waiting") this.entryPlaced(bot, m, order.size, order.sizeMatched, p.at, Boolean(p.inPlay));
+      } else {
+        if (!m.closeBetIds.includes(order.betId)) m.closeBetIds.push(order.betId);
+        m.lastCloseAt = Math.max(m.lastCloseAt ?? 0, p.at);
+        this.log(bot, `Found the closing bet sent before (customerOrderRef ${p.ref}): ${what}.`);
+      }
+    }
+    m.pendingOrderRefs = left.length ? left : undefined;
+  }
 
   private async refresh(view: MarketView) {
     view.orders = await this.deps.exchange.currentOrders([view.marketId]);

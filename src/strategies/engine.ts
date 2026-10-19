@@ -18,6 +18,7 @@ import {
   TEMPLATES,
   findTemplate,
   groupValues,
+  hasCloseTargets,
   normaliseParameters,
   parameterProblems,
   parseParameters,
@@ -57,13 +58,23 @@ export interface EngineDeps {
 
 const MAX_SEQUENCE_DEPTH = 5;
 const DEFAULT_MATCHING_TIMEOUT_MS = 5000;
+/** Fill or kill: attempts to cancel the unmatched remainder before reporting that it may still rest. */
+const FILL_OR_KILL_CANCEL_ATTEMPTS = 3;
+const FILL_OR_KILL_CANCEL_RETRY_MS = 1000;
 
 const sum = (values: number[]) => values.reduce((total, v) => total + v, 0);
 
 /** Outcome bookkeeping of one execution. */
 class Run {
   readonly problems: string[] = [];
+  /** Nothing was done because a criterion was not met or an order was not sent (status false when nothing else acted). */
   readonly skips: string[] = [];
+  /** Nothing was needed (already flat, nothing to cancel): a Skipped outcome with only these keeps status true. */
+  readonly noops: string[] = [];
+  /** Said in `message` whatever the outcome (e.g. parameters that were ignored). */
+  readonly warnings: string[] = [];
+  /** Bets that may still be in an unintended state (e.g. a fill-or-kill bet still resting): status false. */
+  readonly unresolved: string[] = [];
   readonly rejected: RejectedOrder[] = [];
   readonly botIds: string[] = [];
   /** Successful actions: bets placed, bets cancelled. */
@@ -74,6 +85,8 @@ class Run {
   unclosed = 0;
   /** Sequence Execution: message of the step that failed (status false even after earlier bets). */
   failedStep?: string;
+  /** Sequence Execution: the step that stopped the sequence was Skipped rather than Failed. */
+  failedStepSkipped = false;
 
   constructor(readonly result: ExecutionResult) {}
 
@@ -89,6 +102,21 @@ class Run {
   skip(message: string) {
     this.skips.push(message);
     this.note(message);
+  }
+
+  noop(message: string) {
+    this.noops.push(message);
+    this.note(message);
+  }
+
+  warn(message: string) {
+    this.warnings.push(message);
+    this.note(message);
+  }
+
+  unresolve(message: string) {
+    this.unresolved.push(message);
+    this.problem(message);
   }
 
   reject(order: PlannedOrder, reason: string) {
@@ -141,7 +169,7 @@ class Run {
     const placed = r.bets.filter((b) => b.status === "SUCCESS").length;
     const acted = this.unclosed && !placed ? this.botIds.length : this.done + this.botIds.length;
     if (this.failedStep !== undefined) {
-      r.outcome = acted || this.uncertain ? "PartiallyExecuted" : "Failed";
+      r.outcome = acted || this.uncertain ? "PartiallyExecuted" : this.failedStepSkipped ? "Skipped" : "Failed";
       r.status = false;
       r.message = this.failedStep;
       return r;
@@ -149,16 +177,22 @@ class Run {
     if (!acted && !this.uncertain) r.outcome = this.problems.length ? "Failed" : "Skipped";
     else if (this.problems.length || this.uncertain) r.outcome = "PartiallyExecuted";
     else r.outcome = this.botIds.length ? "Started" : "Executed";
-    r.status = r.outcome !== "Failed";
+    // Skipped is a success only when nothing was needed; a bet not placed because of a criterion is not.
+    const nothingNeeded = r.outcome === "Skipped" && !this.skips.length && this.noops.length > 0;
+    r.status = r.outcome !== "Failed" && (r.outcome !== "Skipped" || nothingNeeded) && !this.unresolved.length;
     if (r.outcome === "Failed") r.message = this.problems.join(" ");
-    else if (r.outcome === "Skipped") r.message = this.skips.join(" ") || r.messages.join(" ") || "Nothing to do.";
-    else if (r.outcome === "PartiallyExecuted") {
+    else if (r.outcome === "Skipped") {
+      r.message = nothingNeeded
+        ? `Nothing needed to be done: ${this.noops.join(" ")}`
+        : `Nothing was placed: ${[...this.skips, ...this.noops].join(" ") || r.messages.join(" ") || "no action was taken."}`;
+    } else if (r.outcome === "PartiallyExecuted") {
       const cancelled = r.cancelled.filter((c) => c.status === "SUCCESS").length;
       const unknown = this.uncertain ? ` ${this.uncertain} bet(s) have an unknown outcome: check get_current_orders before retrying.` : "";
       r.message =
         `Partially executed: ${placed} bet(s) placed, ${cancelled} cancelled, ${this.botIds.length} bot(s) started; do not simply retry. ` +
         `${this.problems.join(" ")}${unknown}`.trim();
     } else if (r.outcome === "Started") r.message = `Started bot ${this.botIds.join(", ")} to manage the position; follow it with get_bots.`;
+    if (this.warnings.length) r.message = [r.message, ...this.warnings].filter(Boolean).join(" ");
     return r;
   }
 }
@@ -178,6 +212,8 @@ interface Exec {
   setting: StrategySetting;
   template: TemplateSpec;
   values: Params;
+  /** Parameters set explicitly by the setting or the overrides (canonical names, before defaults). */
+  given: Params;
   tag: StrategyTag;
   market: MarketContext;
 }
@@ -243,13 +279,15 @@ export class StrategyEngine {
     return [...BUILT_IN_SETTINGS.filter((s) => !overridden.has(s.name.toLowerCase())), ...custom].map((s) => structuredClone(s));
   }
 
-  /** Resolve a setting by name or alias (case-insensitive); throws with the available names. */
+  /**
+   * Resolve a setting by name or alias (case-insensitive); throws with the available names. A custom
+   * setting that replaces a built-in also takes over the built-in's aliases.
+   */
   get(name: string): StrategySetting {
     const wanted = String(name ?? "").trim().toLowerCase();
-    const found =
-      this.deps.state.customStrategies.get(wanted) ??
-      BUILT_IN_SETTINGS.find((s) => s.name.toLowerCase() === wanted) ??
-      BUILT_IN_SETTINGS.find((s) => s.aliases?.some((a) => a.toLowerCase() === wanted));
+    const custom = this.deps.state.customStrategies;
+    const builtIn = this.builtIn(wanted);
+    const found = custom.get(wanted) ?? (builtIn && custom.get(builtIn.name.toLowerCase())) ?? builtIn;
     if (!found) {
       throw new Error(`Strategy setting "${name}" not found. Available: ${this.list().map((s) => s.name).join(", ")}. Create one with create_strategy_settings.`);
     }
@@ -306,20 +344,25 @@ export class StrategyEngine {
     return structuredClone(setting);
   }
 
-  /** Delete a custom setting (built-ins become visible again). */
+  /** Delete a custom setting (built-ins become visible again); a built-in's alias deletes the setting that replaced it. */
   remove(name: string): boolean {
     const key = String(name ?? "").trim().toLowerCase();
-    if (this.deps.state.customStrategies.delete(key)) {
+    const builtIn = this.builtIn(key);
+    if (this.deps.state.customStrategies.delete(key) || (builtIn && this.deps.state.customStrategies.delete(builtIn.name.toLowerCase()))) {
       this.deps.state.changed();
       return true;
     }
-    if (this.isBuiltIn(name)) throw new Error(`"${name}" is a built-in setting and cannot be deleted.`);
+    if (builtIn) throw new Error(`"${name}" is a built-in setting and cannot be deleted.`);
     return false;
   }
 
+  /** The built-in setting with this lower-case name, or else with this alias. */
+  private builtIn(wanted: string): StrategySetting | undefined {
+    return BUILT_IN_SETTINGS.find((s) => s.name.toLowerCase() === wanted) ?? BUILT_IN_SETTINGS.find((s) => s.aliases?.some((a) => a.toLowerCase() === wanted));
+  }
+
   private isBuiltIn(name: string): boolean {
-    const wanted = String(name ?? "").trim().toLowerCase();
-    return BUILT_IN_SETTINGS.some((s) => s.name.toLowerCase() === wanted || s.aliases?.some((a) => a.toLowerCase() === wanted));
+    return this.builtIn(String(name ?? "").trim().toLowerCase()) !== undefined;
   }
 
   private exists(name: string): boolean {
@@ -410,7 +453,8 @@ export class StrategyEngine {
     }
     const market: MarketContext = { id, catalogue, book, ladder: ladderOf(catalogue), rules: await this.deps.exchange.currencyRules(), startMs: startOf(catalogue) };
     const reference = typeof values.StrategyReference === "string" && values.StrategyReference ? values.StrategyReference : this.deps.state.strategyRefFor(setting.name);
-    const exec: Exec = { run, setting, template, values, tag: { name: setting.name, ref: reference }, market };
+    const given = { ...parseParameters(template, setting.parameters), ...parseParameters(template, overrides) };
+    const exec: Exec = { run, setting, template, values, given, tag: { name: setting.name, ref: reference }, market };
     switch (template.name) {
       case TEMPLATE.placeBet:
       case TEMPLATE.fillOrKill:
@@ -563,25 +607,51 @@ export class StrategyEngine {
       }
     };
     let pending = entries.filter((e) => e.bet.status === "SUCCESS" && e.bet.betId && (e.bet.sizeMatched ?? 0) < e.bet.size - 1e-9);
+    let pollError: string | undefined;
     for (let left = timeout; pending.length && left > 0; ) {
       const step = Math.min(1000, left);
       left -= step;
       await this.sleep(step);
-      const orders = await this.deps.exchange.currentOrders([market.id]);
+      let orders: OrderView[];
+      try {
+        orders = await this.deps.exchange.currentOrders([market.id]);
+      } catch (error) {
+        // The cancel works by bet id, so a failed look only means the bets are treated as still unmatched.
+        pollError ??= (error as Error).message;
+        continue;
+      }
       pending = pending.filter((entry) => {
         const order = orders.find((o) => o.betId === entry.bet.betId);
         if (order) update(entry, order);
         return Boolean(order && order.sizeRemaining > 0);
       });
     }
+    if (pollError) run.note(`Fill or kill: could not check the matching (${pollError}); cancelling whatever is unmatched.`);
     if (!pending.length) {
       if (entries.some((e) => e.bet.status === "SUCCESS")) run.note("Fill or kill: nothing left unmatched.");
       return;
     }
     const ids = pending.map((e) => e.bet.betId!);
-    const results = await this.deps.exchange.cancelOrders(market.id, ids);
-    run.cancels(results, ids);
-    const after = await this.deps.exchange.currentOrders([market.id]);
+    const { results, live, error } = await this.cancelWithRetries(market.id, ids);
+    run.cancels(
+      results.filter((r) => !live.includes(r.betId)),
+      ids.filter((id) => !live.includes(id)),
+    );
+    if (live.length) {
+      const failed = results.filter((r) => live.includes(r.betId));
+      run.result.cancelled.push(...failed);
+      const why = error ?? (failed.map((r) => `${r.betId}: ${r.status}`).join(", ") || "no cancel report");
+      run.unresolve(
+        `Fill or kill: the unmatched part of bet(s) ${live.join(", ")} could not be cancelled after ${FILL_OR_KILL_CANCEL_ATTEMPTS} attempts (${why}); ` +
+          "it may still be resting on the exchange. Check get_current_orders and cancel it with cancel_bets.",
+      );
+    }
+    let after: OrderView[] = [];
+    try {
+      after = await this.deps.exchange.currentOrders([market.id]);
+    } catch (error) {
+      run.note(`Fill or kill: could not re-read the bets after the cancel (${(error as Error).message}); matched sizes may be out of date.`);
+    }
     for (const entry of pending) {
       const order = after.find((o) => o.betId === entry.bet.betId);
       if (order) update(entry, order);
@@ -592,6 +662,31 @@ export class StrategyEngine {
         );
       }
     }
+  }
+
+  /**
+   * Cancel bets by id, retrying (bounded) when the request throws or a bet's cancel is not confirmed.
+   * `live` lists the bets that may still be resting; `error` is the last request error, if any.
+   */
+  private async cancelWithRetries(marketId: string, betIds: string[]): Promise<{ results: CancelResult[]; live: string[]; error?: string }> {
+    const latest = new Map<string, CancelResult>();
+    let live = betIds;
+    let error: string | undefined;
+    for (let attempt = 0; attempt < FILL_OR_KILL_CANCEL_ATTEMPTS && live.length; attempt++) {
+      if (attempt) await this.sleep(FILL_OR_KILL_CANCEL_RETRY_MS);
+      try {
+        const results = await this.deps.exchange.cancelOrders(marketId, live);
+        error = undefined;
+        for (const r of results) latest.set(r.betId, r);
+        live = live.filter((id) => {
+          const r = results.find((x) => x.betId === id);
+          return !r || !cancelSucceeded(r);
+        });
+      } catch (e) {
+        error = (e as Error).message;
+      }
+    }
+    return { results: [...latest.values()], live, error };
   }
 
   /** "Place Bet and Close Selection Bet Position": entry now (or later), then a managing bot. */
@@ -638,7 +733,7 @@ export class StrategyEngine {
 
   private describeTargets(close: Params): string {
     const parts: string[] = [];
-    if (close.ClosePositionImmediately === true) parts.push("close as soon as matched");
+    if (close.ClosePositionImmediately === true && !hasCloseTargets(close)) parts.push("close as soon as matched");
     const unit = close.ProfitLossType === "Money" ? "" : close.ProfitLossType === "Percentage" ? "%" : " ticks";
     if (Number(close.Profit) > 0) parts.push(`profit target ${close.Profit}${unit}`);
     if (Number(close.Loss) > 0) parts.push(`stop-loss ${close.Loss}${unit}`);
@@ -683,8 +778,19 @@ export class StrategyEngine {
 
   private async closeSelection(exec: Exec, targets: SelectionRef[]) {
     if (!targets.length) return;
-    const { run, values, market } = exec;
-    if (values.ClosePositionImmediately !== false) return this.closePositions(exec, targets);
+    const { run, values, market, given } = exec;
+    // Profit/Loss/ClosePositionTimeSpan ask for a bot that closes on them, unless ClosePositionImmediately is explicitly true.
+    const targeted = hasCloseTargets(values);
+    const immediate = "ClosePositionImmediately" in given ? values.ClosePositionImmediately === true : !targeted;
+    if (immediate) {
+      if (targeted) {
+        run.warn(
+          "ClosePositionImmediately is true, so the Profit/Loss/ClosePositionTimeSpan targets were ignored and the position was closed now (leave ClosePositionImmediately out, or pass false, to close on the targets).",
+        );
+      }
+      return this.closePositions(exec, targets);
+    }
+    values.ClosePositionImmediately = false; // the bot closes on the targets
     const closeAt = this.closeTime(exec, values.ClosePositionTimeSpan);
     const orders = await this.deps.exchange.currentOrders([market.id]);
     for (const ref of targets) {
@@ -692,7 +798,7 @@ export class StrategyEngine {
       const mine = orders.filter((o) => o.selectionId === selectionKey(ref));
       const position = positionOf(mine);
       if (isFlatAt(position, values.HedgingEnabled !== false, runnerOf(market.book, ref)) && !mine.some((o) => o.sizeRemaining > 0)) {
-        run.skip(`${name}: no open position to manage (${mine.length ? `already flat: ${describePosition(position)}` : "no bets"}).`);
+        run.noop(`${name}: no open position to manage (${mine.length ? `already flat: ${describePosition(position)}` : "no bets"}).`);
         continue;
       }
       this.startBot(
@@ -715,7 +821,7 @@ export class StrategyEngine {
       const runner = runnerOf(market.book, ref);
       const flat = isFlatAt(position, values.HedgingEnabled !== false, runner);
       if (flat && !mine.some((o) => o.sizeRemaining > 0)) {
-        run.skip(`${name}: no position to protect with a trailing stop.`);
+        run.noop(`${name}: no position to protect with a trailing stop.`);
         continue;
       }
       // The trail starts from the price the position could be closed at now.
@@ -770,7 +876,7 @@ export class StrategyEngine {
       const mine = orders.filter((o) => o.selectionId === key);
       const position = positionOf(mine);
       const flat = () => {
-        if (wanted) run.skip(`${name}: ${mine.some((o) => o.sizeMatched > 0) ? `already flat (${describePosition(position)})` : "no matched bets"}; nothing to close.`);
+        if (wanted) run.noop(`${name}: ${mine.some((o) => o.sizeMatched > 0) ? `already flat (${describePosition(position)})` : "no matched bets"}; nothing to close.`);
       };
       if (isFlat(position, hedging)) {
         flat();
@@ -782,7 +888,7 @@ export class StrategyEngine {
       };
       const runner = runnerOf(market.book, ref);
       if (!runner || runner.status !== "ACTIVE") {
-        run.note(`${name}: the selection is ${runnerStatusName(runner?.status) ?? "not in the market"}; Betfair voids a non-runner's bets, so there is nothing to close.`);
+        run.noop(`${name}: the selection is ${runnerStatusName(runner?.status) ?? "not in the market"}; Betfair voids a non-runner's bets, so there is nothing to close.`);
         continue;
       }
       needed++;
@@ -813,7 +919,7 @@ export class StrategyEngine {
       const tooSmall = betSizeProblem(order.size, order.price, market.rules);
       if (tooSmall) {
         belowMinimum++;
-        run.note(`${name}: the closing bet ${order.side} ${order.size} @ ${order.price} was not sent: ${tooSmall} The position (${describePosition(position)}) stays open.`);
+        run.skip(`${name}: the closing bet ${order.side} ${order.size} @ ${order.price} was not sent: ${tooSmall} The position (${describePosition(position)}) stays open.`);
         continue;
       }
       hedges.push({ ...ref, side: order.side, price: order.price, size: order.size, persistenceType: "LAPSE", reducesRisk: true, role: "hedge", selectionName: name });
@@ -827,7 +933,7 @@ export class StrategyEngine {
     }
     run.unclosed += failed;
     if (!needed) {
-      if (!wanted) run.skip("No open matched position in this market; nothing to close.");
+      if (!wanted) run.noop("No open matched position in this market; nothing to close.");
     } else if (!wanted || wanted.size > 1) {
       const small = belowMinimum ? `, ${belowMinimum} below Betfair's minimum bet` : "";
       run.note(`${needed} position(s) needed a hedge: ${hedged} hedged, ${failed} failed${small}.`);
@@ -917,7 +1023,7 @@ export class StrategyEngine {
     const orders = await this.deps.exchange.currentOrders([marketId]);
     const resting = orders.filter((o) => o.sizeRemaining > 0 && (marketScope || keys.has(o.selectionId)));
     if (!resting.length) {
-      run.skip(marketScope ? "No unmatched bets in this market." : `No unmatched bets on ${targets.map((ref) => this.nameOf(catalogue, ref)).join(", ")}.`);
+      run.noop(marketScope ? "No unmatched bets in this market." : `No unmatched bets on ${targets.map((ref) => this.nameOf(catalogue, ref)).join(", ")}.`);
       return;
     }
     const ids = resting.map((o) => o.betId);
@@ -972,11 +1078,14 @@ export class StrategyEngine {
       if (!r.status) {
         const rest = steps.slice(i + 1).map((s) => s.name);
         if (rest.length) run.note(`Not executed: ${rest.join(", ")}.`);
-        run.failedStep = `Step "${step.name}" failed: ${r.message}`;
+        run.failedStepSkipped = r.outcome === "Skipped";
+        run.failedStep = `Step "${step.name}" ${run.failedStepSkipped ? "was skipped" : "failed"}: ${r.message}`;
         return;
       }
       run.problems.push(...sub.problems.map((p) => `${step.name}: ${p}`));
       run.skips.push(...sub.skips.map((s) => `${step.name}: ${s}`));
+      run.noops.push(...sub.noops.map((s) => `${step.name}: ${s}`));
+      run.warnings.push(...sub.warnings.map((s) => `${step.name}: ${s}`));
     }
   }
 }

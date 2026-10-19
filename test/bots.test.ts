@@ -7,7 +7,9 @@ import { currencyRules, type CurrencyRules } from "../src/betfair/currency.js";
 import { offsetTicks } from "../src/betfair/ticks.js";
 import type { Side } from "../src/betfair/types.js";
 import { loadConfig, type Config } from "../src/config.js";
+import { LiveExchange } from "../src/exchange/live.js";
 import { betOutcomeProfit } from "../src/exchange/math.js";
+import { PaperExchange } from "../src/exchange/paper.js";
 import type { CancelResult, Exchange, FundsView, OrderRequest, OrderView, PlacedBet, SettledBets, StrategyTag } from "../src/exchange/types.js";
 import { formatSelectionId } from "../src/format.js";
 import { MarketService } from "../src/markets.js";
@@ -34,6 +36,7 @@ interface FakeOrder {
   cancelled: number;
   persistenceType: string;
   tag: StrategyTag;
+  customerOrderRef?: string;
 }
 
 const cents = (value: number) => Math.round(value * 100) / 100;
@@ -85,6 +88,7 @@ class FakeExchange implements Exchange {
         cancelled: 0,
         persistenceType: o.persistenceType,
         tag,
+        customerOrderRef: o.customerOrderRef,
       };
       this.orders.push(order);
       return { ...base, status: "SUCCESS" as const, betId: order.betId, sizeMatched: matched, averagePriceMatched: matched ? o.price : undefined };
@@ -139,6 +143,7 @@ class FakeExchange implements Exchange {
         persistenceType: o.persistenceType,
         placedDate: new Date().toISOString(),
         strategy: o.tag.name,
+        customerOrderRef: o.customerOrderRef,
       }));
   }
 
@@ -371,10 +376,16 @@ describe("Place Bet and Close Selection Bet Position bots", () => {
     assert.ok(Math.abs(p.ifLose) < 0.01 && p.ifWin > 3.9);
   });
 
-  test("ClosePositionImmediately closes as soon as the entry is matched", async () => {
+  test("ClosePositionImmediately without targets closes as soon as the entry is matched", async () => {
     const f = setup();
     f.exchange.fill = (o) => (o.reducesRisk ? 1 : 0);
-    const { bot } = await started(f, "Trade x profit", 101, { "CloseBetPosition.ClosePositionImmediately": true });
+    const { result, bot } = await started(f, "Trade x profit", 101, {
+      "CloseBetPosition.ClosePositionImmediately": true,
+      "CloseBetPosition.Profit": 0,
+      "CloseBetPosition.Loss": 0,
+      "CloseBetPosition.ClosePositionTimeSpan": null,
+    });
+    assert.ok(result.messages.some((m) => /green up on: close as soon as matched\./.test(m)), JSON.stringify(result.messages));
     await f.bots.tick();
     assert.equal(f.exchange.placed.length, 1, "entry not matched yet");
     assert.match(logText(bot()), /Waiting for the entry to match/);
@@ -382,6 +393,32 @@ describe("Place Bet and Close Selection Bet Position bots", () => {
     await f.bots.tick();
     assert.deepEqual(f.exchange.sent(1).map((o) => [o.side, o.price, o.size]), [["LAY", 3.05, 9.84]]);
     assert.equal(bot().status, "finished");
+  });
+
+  test("ClosePositionImmediately with Profit/Loss targets: the targets decide (Trading Strategy as the prompt passes it)", async () => {
+    const f = setup();
+    const { result, bot } = await started(f, "Trading Strategy", 101, {
+      OpenBetPosition: { BetType: "Back", Stake: 10, StakeType: "Stake" },
+      CloseBetPosition: { ProfitLossType: "Percentage", Profit: 15, Loss: 20, HedgingEnabled: true, ClosePositionImmediately: true },
+    });
+    const startText = result.messages.join(" ");
+    assert.match(startText, /green up on: profit target 15%, stop-loss 20%\./);
+    assert.doesNotMatch(startText, /close as soon as matched/);
+    await f.bots.tick();
+    assert.equal(bot().status, "running", "matched at 3 with the lay at 3.05: no target reached");
+    assert.equal(f.exchange.placed.length, 1);
+    f.fake.setOffers(101, [[2.58, 100]], [[2.6, 100]]);
+    await f.bots.tick();
+    assert.match(logText(bot()), /Closing: profit 15\.4% of the opening risk 10 reached the target 15%/);
+    assert.deepEqual(f.exchange.sent(1).map((o) => [o.side, o.price, o.size]), [["LAY", 2.6, 11.54]]);
+    assert.equal(bot().status, "finished");
+
+    // The decoded "Trade 2 Ticks Profit or 10 Ticks Loss" has the flag set too: it still waits for 2 ticks.
+    const g = setup();
+    const ticks = await started(g, "Trade 2 Ticks Profit or 10 Ticks Loss");
+    await g.bots.tick();
+    assert.equal(ticks.bot().status, "running");
+    assert.equal(g.exchange.placed.length, 1);
   });
 
   test("an entry that never matches lapses at the off (AtInPlayKeepBet false)", async () => {
@@ -437,6 +474,97 @@ describe("Place Bet and Close Selection Bet Position bots", () => {
     assert.match(logText(partial.bot()), /hedging 5\.77 instead of 11\.54/);
     const p = await position(g.exchange);
     assert.ok(Math.abs(p.ifWin - p.ifLose) < 0.02, "the selection is green");
+  });
+
+  test("a resting hedge from a manual Close Selection is not hedged again: the bot waits, then finishes or hedges what is left", async () => {
+    const f = setup();
+    const { bot } = await started(f, "Trade x profit");
+    f.exchange.fill = 0;
+    await f.engine.execute("Close Selection Bet Position", W, [sel(101)]);
+    assert.deepEqual(f.exchange.sent(1).map((o) => [o.side, o.price, o.size]), [["LAY", 3.05, 9.84]], "the manual hedge F2 rests");
+    f.exchange.fill = 1;
+    f.fake.setOffers(101, [[2.58, 100]], [[2.6, 100]]);
+    await f.bots.tick();
+    assert.equal(f.exchange.placed.length, 2, "no second LAY");
+    assert.equal(bot().status, "running", "unmatched bets never finish the bot");
+    assert.match(logText(bot()), /Unmatched LAY bet\(s\) F2 on the selection would close its position when matched/);
+    await f.bots.tick();
+    assert.equal(f.exchange.placed.length, 2);
+    f.exchange.match("F2");
+    await f.bots.tick();
+    assert.equal(bot().status, "finished");
+    assert.match(logText(bot()), /Other bets already closed the selection's position/);
+    const p = await position(f.exchange);
+    assert.ok(Math.abs(p.ifWin - p.ifLose) < 0.02, JSON.stringify(p));
+
+    // The manual hedge is cancelled instead: the bot hedges its own part after all.
+    const g = setup();
+    const other = await started(g, "Trade x profit");
+    g.exchange.fill = 0;
+    await g.engine.execute("Close Selection Bet Position", W, [sel(101)]);
+    g.exchange.fill = 1;
+    g.fake.setOffers(101, [[2.58, 100]], [[2.6, 100]]);
+    await g.bots.tick();
+    assert.equal(g.exchange.placed.length, 2);
+    await g.exchange.cancelOrders(W, ["F2"]);
+    await g.bots.tick();
+    assert.deepEqual(g.exchange.sent(2).map((o) => [o.side, o.price, o.size]), [["LAY", 2.6, 11.54]]);
+    assert.equal(other.bot().status, "finished");
+
+    // A resting bet that covers part of the position: only the rest is hedged.
+    const h = setup();
+    const part = await started(h, "Trade x profit");
+    h.exchange.fill = 0;
+    await h.exchange.placeOrders(W, [{ selectionId: 101, handicap: 0, side: "LAY", price: 3, size: 5, persistenceType: "LAPSE" }], { name: "manual", ref: "manual" });
+    h.exchange.fill = 1;
+    h.fake.setOffers(101, [[2.58, 100]], [[2.6, 100]]);
+    await h.bots.tick();
+    assert.deepEqual(h.exchange.sent(2).map((o) => [o.side, o.price, o.size]), [["LAY", 2.6, 5.77]], "what the resting LAY 5 @ 3 leaves open");
+    assert.match(logText(part.bot()), /hedging 5\.77 instead of 11\.54/);
+    h.exchange.match("F2");
+    await h.bots.tick();
+    assert.equal(part.bot().status, "finished");
+    const q = await position(h.exchange);
+    assert.ok(Math.abs(q.ifWin - q.ifLose) < 0.02, JSON.stringify(q));
+  });
+
+  test("a trade bot does not hedge again while a trailing stop's closing bet rests on the selection", async () => {
+    const f = setup();
+    const trade = await started(f, "Trade x profit", 101, { "CloseBetPosition.ProfitLossType": "Ticks", "CloseBetPosition.Profit": 0, "CloseBetPosition.Loss": 2 });
+    await started(f, "Trailing Stop Loss 3 Ticks");
+    await f.bots.tick();
+    f.exchange.fill = 0; // closing bets rest
+    f.fake.setOffers(101, [[3.15, 100]], [[3.2, 100]]);
+    await f.bots.tick(); // the trade bot lays F2; the trailing stop cancels it and lays F3
+    await f.bots.tick();
+    await f.bots.tick();
+    assert.deepEqual(
+      f.exchange.sent(1).map((o) => [o.side, o.price, o.size]),
+      [
+        ["LAY", 3.2, 9.38],
+        ["LAY", 3.2, 9.38],
+      ],
+      "one resting hedge at a time",
+    );
+    assert.match(logText(trade.bot()), /Unmatched LAY bet\(s\) F3 on the selection would close its position/);
+    for (const o of f.exchange.orders) if (f.exchange.remaining(o) > 0) f.exchange.match(o.betId);
+    const p = await position(f.exchange);
+    assert.ok(Math.abs(p.ifWin - p.ifLose) < 0.05 && p.ifWin < 0.5, `green, not reversed: ${JSON.stringify(p)}`);
+    await f.bots.tick();
+    assert.equal(trade.bot().status, "finished");
+    assert.equal(f.exchange.placed.length, 3);
+  });
+
+  test("stop with closePosition does not hedge over a resting hedge of other bets", async () => {
+    const f = setup();
+    const { bot } = await started(f, "Trade x profit");
+    f.exchange.fill = 0;
+    await f.engine.execute("Close Selection Bet Position", W, [sel(101)]);
+    await assert.rejects(
+      () => f.bots.stop(bot().id, { closePosition: true }),
+      /position was not closed: Unmatched LAY bet\(s\) F2 on the selection would close its position when matched/,
+    );
+    assert.equal(f.exchange.placed.length, 2, "no second hedge");
   });
 
   test("a manual close waits for a bot that is closing, so the selection is hedged once", async () => {
@@ -643,6 +771,143 @@ describe("bot runner", () => {
     assert.equal(g.bots.list()[0].status, "finished");
     assert.equal(f.exchange.sent(1)[0].size, 11.54);
     second.release();
+  });
+
+  test("a delayed bet in flight during a restart is found by its customerOrderRef, not placed again", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bots-"));
+    const first = State.forDataDir(dir);
+    const f = setup({ state: first });
+    const { result } = await started(f, "Bet 10 Euro", 101, { PlaceBetTimeSpan: "-0:05:00" });
+    first.flush(); // the started bot has been saved
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    f.exchange.beforePlace = () => gate;
+    f.clock.t = f.start - 300_000;
+    const tick = f.bots.tick(); // sends the bet; the process stops while the request is in flight
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(f.exchange.placed.length, 0, "in flight");
+    first.release();
+    const second = State.forDataDir(dir); // what the next process loads
+    release();
+    await tick;
+    f.exchange.beforePlace = undefined;
+
+    const g = setup({ state: second, fake: f.fake, exchange: f.exchange });
+    g.clock.t = f.clock.t + 1000;
+    await g.bots.tick();
+    assert.equal(f.exchange.placed.length, 1, "placed once");
+    const [sent] = f.exchange.sent();
+    assert.match(sent.customerOrderRef ?? "", new RegExp(`^${result.botId}-e[0-9a-f]{12}$`));
+    assert.ok(sent.customerOrderRef!.length <= 32, "Betfair's limit");
+    const [resumed] = g.bots.list();
+    assert.equal(resumed.id, result.botId);
+    assert.equal(resumed.status, "finished", logText(resumed));
+    assert.deepEqual(resumed.betIds, ["F1"]);
+    assert.equal(resumed.meta!.pendingOrderRefs, undefined);
+    assert.ok(logText(resumed).includes(`Found the entry bet sent before (customerOrderRef ${sent.customerOrderRef}): BACK 10 @ 3 (bet F1, matched 10).`), logText(resumed));
+    second.release();
+  });
+
+  test("a closing bet in flight during a restart is found and adopted, so the position is hedged once", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bots-"));
+    const first = State.forDataDir(dir);
+    const f = setup({ state: first });
+    f.exchange.fill = (o) => (o.reducesRisk ? 0 : 1); // the closing bet rests
+    const { result } = await started(f, "Trade x profit");
+    first.flush();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    f.exchange.beforePlace = (orders) => (orders[0].reducesRisk ? gate : Promise.resolve());
+    f.fake.setOffers(101, [[2.58, 100]], [[2.6, 100]]);
+    const tick = f.bots.tick();
+    await new Promise((resolve) => setImmediate(resolve));
+    first.release();
+    const second = State.forDataDir(dir);
+    release();
+    await tick;
+    f.exchange.beforePlace = undefined;
+
+    const g = setup({ state: second, fake: f.fake, exchange: f.exchange });
+    g.clock.t = f.clock.t + 1000;
+    await g.bots.tick();
+    assert.equal(f.exchange.placed.length, 2, "one closing bet");
+    const resumed = () => g.bots.list().find((b) => b.id === result.botId)!;
+    assert.deepEqual(resumed().betIds, ["F1", "F2"]);
+    assert.deepEqual(resumed().meta!.closeBetIds, ["F2"]);
+    assert.equal(resumed().status, "running");
+    assert.match(logText(resumed()), /Found the closing bet sent before \(customerOrderRef bot-[0-9a-f]+-c[0-9a-f]{12}\): LAY 11\.54 @ 2\.6 \(bet F2, matched 0\)/);
+    f.exchange.match("F2");
+    await g.bots.tick();
+    assert.equal(resumed().status, "finished", logText(resumed()));
+    assert.equal(f.exchange.placed.length, 2);
+    second.release();
+  });
+
+  test("a pending bet that is not found within 2 minutes is dropped with a log line; nothing is placed before", async () => {
+    const f = setup();
+    const { bot } = await started(f, "Bet 10 Euro", 101, { PlaceBetTimeSpan: "-0:05:00" });
+    f.clock.t = f.start - 300_000;
+    // As saved by a process that stopped before its request reached Betfair.
+    (f.state.bots[0].meta as Record<string, unknown>).pendingOrderRefs = [{ ref: "bot-lost-e000000000000", role: "entry", at: f.clock.t }];
+    await f.bots.tick();
+    f.clock.t += 60_000;
+    await f.bots.tick();
+    assert.equal(f.exchange.placed.length, 0, "waits while the bet may still show up");
+    assert.match(logText(bot()), /Waiting to find the bet\(s\) sent before \(entry bot-lost-e000000000000\)/);
+    f.clock.t += 60_000;
+    await f.bots.tick();
+    assert.match(logText(bot()), /\(customerOrderRef bot-lost-e000000000000\) is not among the current orders after 2 minutes: it was not placed/);
+    assert.deepEqual(f.exchange.sent().map((o) => [o.side, o.price, o.size]), [["BACK", 3, 10]]);
+    assert.equal(bot().status, "finished");
+  });
+
+  test("stop with closePosition looks for bets sent before a restart before hedging", async () => {
+    const f = setup();
+    const { bot } = await started(f, "Trade x profit");
+    (f.state.bots[0].meta as Record<string, unknown>).pendingOrderRefs = [{ ref: "bot-lost-c000000000000", role: "close", at: f.clock.t }];
+    await assert.rejects(
+      () => f.bots.stop(bot().id, { closePosition: true }),
+      /position was not closed: bet\(s\) sent earlier \(close bot-lost-c000000000000\) are not among the current orders yet/,
+    );
+    assert.equal(f.exchange.placed.length, 1, "no hedge");
+  });
+
+  test("the state is saved with the order's customerOrderRef before the order is sent", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bots-"));
+    const state = State.forDataDir(dir);
+    const f = setup({ state });
+    await started(f, "Trade x profit");
+    let saved: unknown;
+    f.exchange.beforePlace = async () => {
+      saved = JSON.parse(fs.readFileSync(path.join(dir, "state.json"), "utf8")).bots[0].meta.pendingOrderRefs;
+    };
+    f.fake.setOffers(101, [[2.58, 100]], [[2.6, 100]]);
+    await f.bots.tick();
+    const [close] = f.exchange.sent(1);
+    assert.deepEqual(saved, [{ ref: close.customerOrderRef, role: "close", at: f.clock.t, inPlay: false }]);
+    assert.equal(f.bots.list()[0].meta!.pendingOrderRefs, undefined, "cleared once the result is recorded");
+    state.release();
+  });
+
+  test("bot orders carry their customerOrderRef to Betfair and to the paper ledger", async () => {
+    const ref = "bot-0123abcd-e0123456789ab";
+    const order = { selectionId: 101, handicap: 0, side: "BACK" as const, price: 3, size: 2, persistenceType: "LAPSE" as const, customerOrderRef: ref };
+    const fake = new FakeBetfair();
+    const live = new LiveExchange(fake, new State(), {}, { sleep: async () => undefined });
+    const [bet] = await live.placeOrders(W, [order], { name: "Bet 10 Euro", ref: "Bet 10 Euro" });
+    const call = fake.calls.find((c) => c.method === "placeOrders")!;
+    assert.equal(call.args.instructions[0].customerOrderRef, ref);
+    assert.equal(bet.customerOrderRef, ref);
+    assert.equal((await live.currentOrders([W])).find((o) => o.betId === bet.betId)!.customerOrderRef, ref);
+
+    const state = new State();
+    const paper = new PaperExchange(new MarketService(new FakeBetfair(), state, new Recorder(), 20), state, {
+      startingBalance: 1000,
+      commissionRate: 0.05,
+      currency: currencyRules("GBP"),
+    });
+    const [placed] = await paper.placeOrders(W, [order], { name: "Bet 10 Euro", ref: "Bet 10 Euro" });
+    assert.equal((await paper.currentOrders([W])).find((o) => o.betId === placed.betId)!.customerOrderRef, ref);
   });
 
   test("stop with closePosition greens up; stop without it leaves the position", async () => {

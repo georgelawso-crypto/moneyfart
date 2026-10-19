@@ -49,6 +49,10 @@ class FakeExchange implements Exchange {
   unknownNext = 0;
   /** Forced cancel status per bet (undefined = normal behaviour). */
   cancelStatus?: (betId: string) => string | undefined;
+  /** currentOrders throws this many times. */
+  failCurrentOrders = 0;
+  /** cancelOrders throws this many times (after recording the call). */
+  failCancels = 0;
   balance = 1000;
   rules: CurrencyRules = currencyRules("GBP");
   private counter = 0;
@@ -101,6 +105,10 @@ class FakeExchange implements Exchange {
 
   async cancelOrders(marketId: string, betIds: string[] | "ALL"): Promise<CancelResult[]> {
     this.cancelCalls.push({ marketId, betIds: Array.isArray(betIds) ? [...betIds] : betIds });
+    if (this.failCancels > 0) {
+      this.failCancels--;
+      throw new Error("Betfair is unavailable");
+    }
     const ids = betIds === "ALL" ? this.orders.filter((o) => o.marketId === marketId && this.remaining(o) > 0).map((o) => o.betId) : betIds;
     return ids.map((betId) => {
       const o = this.orders.find((x) => x.betId === betId && x.marketId === marketId);
@@ -116,6 +124,10 @@ class FakeExchange implements Exchange {
 
   async currentOrders(marketIds?: string[]): Promise<OrderView[]> {
     this.currentOrdersCalls++;
+    if (this.failCurrentOrders > 0) {
+      this.failCurrentOrders--;
+      throw new Error("Betfair is unavailable");
+    }
     return this.orders
       .filter((o) => !marketIds || marketIds.includes(o.marketId))
       .map((o) => ({
@@ -319,6 +331,33 @@ describe("parameter normalisation", () => {
     assert.throws(() => parseParameters(placeBet, { PriceImprovement: 1.5 }), /whole number/);
   });
 
+  test("PriceImprovement is a signed tick count: negative = a worse price, clamped to the ladder", async () => {
+    assert.deepEqual(parseParameters(placeBet, { PriceImprovement: -1 }), { PriceImprovement: -1 });
+    assert.deepEqual(parseParameters(placeBet, { OddsOffsetTicks: "-2" }), { PriceImprovement: -2 });
+    assert.deepEqual(parseParameters(trade, { "OpenBetPosition.PriceImprovement": -1 }), { "OpenBetPosition.PriceImprovement": -1 });
+    assert.deepEqual(parseParameters(findTemplate("Place Bet - Fill or Kill")!, { PriceImprovement: -3 }), { PriceImprovement: -3 });
+    assert.throws(() => parseParameters(placeBet, { PriceImprovement: -129 }), /PriceImprovement must be a number from -128 to 127, got -129/);
+    assert.throws(() => parseParameters(placeBet, { PriceImprovement: 128 }), /from -128 to 127/);
+    assert.throws(() => parseParameters(placeBet, { PriceImprovement: -1.5 }), /whole number/);
+    const { fake, engine, exchange } = setup();
+    for (const [name, overrides] of [
+      ["Bet 10 Euro", { PriceImprovement: -1 }],
+      ["Lay 10 Euro", { OddsOffsetTicks: -1 }],
+      ["Trade x profit", { "OpenBetPosition.PriceImprovement": -2 }],
+    ] as const) {
+      const result = await engine.execute(name, W, [sel(101)], overrides);
+      assert.notEqual(result.outcome, "Failed", explain(result));
+    }
+    fake.setOffers(102, [[1.02, 100]], [[1.03, 100]]);
+    await engine.execute("Bet 10 Euro", W, [sel(102)], { PriceImprovement: -5 });
+    assert.deepEqual(exchange.sent().map((o) => [o.side, o.price]), [
+      ["BACK", 2.98],
+      ["LAY", 3.1],
+      ["BACK", 2.96],
+      ["BACK", 1.01],
+    ]);
+  });
+
   test("TimeSpans accept .NET strings and seconds, negative too", () => {
     assert.deepEqual(parseParameters(placeBet, { PlaceBetTimeSpan: "-0:05:00" }), { PlaceBetTimeSpan: "-00:05:00" });
     assert.deepEqual(parseParameters(placeBet, { PlaceBetTimeSpan: -300 }), { PlaceBetTimeSpan: "-00:05:00" });
@@ -442,10 +481,10 @@ describe("strategy execution", () => {
     assert.match(refused.message!, /cannot be placed as a BACK limit/);
   });
 
-  test("odds range: outside is Skipped (status true, reason given); the check can be disabled", async () => {
+  test("odds range: outside is Skipped with status false and the reason; the check can be disabled", async () => {
     const { engine, exchange } = setup();
     const skipped = await engine.execute("Bet 10 Euro", W, [sel(101)], { MaximumOdds: 2.5 });
-    assert.equal(skipped.status, true);
+    assert.equal(skipped.status, false);
     assert.equal(skipped.outcome, "Skipped");
     assert.match(skipped.message!, /outside the allowed odds range 1\.01-2\.5/);
     assert.equal(exchange.placed.length, 0);
@@ -457,6 +496,7 @@ describe("strategy execution", () => {
     const { engine, exchange } = setup();
     const tooTight = await engine.execute("Bet 10 Euro", W, [sel(101)], { MinimumOddsDifference: 2 });
     assert.equal(tooTight.outcome, "Skipped");
+    assert.equal(tooTight.status, false);
     assert.match(tooTight.message!, /spread 1 ticks/);
     const tooWide = await engine.execute("Bet 10 Euro", W, [sel(102)], { MaximumOddsDifference: 1 });
     assert.equal(tooWide.outcome, "Skipped");
@@ -502,6 +542,7 @@ describe("strategy execution", () => {
     fake.book().inplay = true;
     const skipped = await engine.execute("Bet 10 Euro", W, [sel(101)], { AllowPlacingBetInPlay: "no" });
     assert.equal(skipped.outcome, "Skipped");
+    assert.equal(skipped.status, false);
     assert.match(skipped.message!, /in-play/);
     await engine.execute("Bet 10 Euro", W, [sel(101)], { AtInPlayKeepBet: "yes" });
     await engine.execute("Bet 10 Euro", W, [sel(101)], { PersistenceType: "Persist" });
@@ -555,9 +596,40 @@ describe("strategy execution", () => {
     clock.t = start - 4000;
     const result = await engine.execute("Trade x profit", W, [sel(101)]);
     assert.equal(result.outcome, "Skipped");
-    assert.equal(result.status, true);
+    assert.equal(result.status, false);
     assert.match(result.message!, /already passed/);
     assert.equal(exchange.placed.length, 0);
+  });
+
+  test("Skipped: status false when a criterion stopped the bet, true only when nothing was needed", async () => {
+    const { fake, engine, exchange } = setup();
+    fake.setOffers(101, [], [[3.05, 100]]);
+    const noPrice = await engine.execute("Bet 10 Euro", W, [sel(101)]);
+    assert.deepEqual([noPrice.status, noPrice.outcome], [false, "Skipped"]);
+    assert.match(noPrice.message!, /^Nothing was placed: Fast Horse: no back price available; no bet placed\.$/);
+    // A sequence stops at a skipped entry: no trailing stop for a bet that was never placed.
+    const sequence = await engine.execute("Back trailing stop loss trading", W, [sel(101)]);
+    assert.deepEqual([sequence.status, sequence.outcome], [false, "Skipped"], explain(sequence));
+    assert.match(sequence.message!, /^Step "Bet 10 Euro" was skipped: .*no back price available/);
+    assert.equal(sequence.botId, undefined);
+    assert.equal(exchange.placed.length, 0);
+
+    // Nothing needed: status true, and the message says so.
+    const cancel = await engine.execute("Cancel Selection Bets", W, [sel(101)]);
+    assert.deepEqual([cancel.status, cancel.outcome], [true, "Skipped"]);
+    assert.equal(cancel.message, "Nothing needed to be done: No unmatched bets on Fast Horse.");
+    const close = await engine.execute("Close Selection Bet Position", W, [sel(101)]);
+    assert.deepEqual([close.status, close.outcome], [true, "Skipped"]);
+    assert.match(close.message!, /^Nothing needed to be done: Fast Horse: no matched bets; nothing to close\.$/);
+    const trailing = await engine.execute("Trailing Stop Loss 3 Ticks", W, [sel(101)]);
+    assert.deepEqual([trailing.status, trailing.outcome], [true, "Skipped"]);
+
+    // A step with nothing to do does not stop a sequence.
+    fake.setOffers(101, [[3, 100]], [[3.05, 100]]);
+    engine.save("Tidy then bet", "Sequence Execution", { StrategyNames: "Cancel Selection Bets;Bet 10 Euro" });
+    const tidy = await engine.execute("Tidy then bet", W, [sel(101)]);
+    assert.deepEqual([tidy.status, tidy.outcome], [true, "Executed"], explain(tidy));
+    assert.deepEqual(exchange.sent().map((o) => [o.side, o.size]), [["BACK", 10]]);
   });
 
   test("risk limits: MAX_STAKE and MAX_LIABILITY on risk-adding orders", async () => {
@@ -667,6 +739,58 @@ describe("fill or kill", () => {
   });
 });
 
+describe("fill or kill when Betfair fails", () => {
+  test("a failed look at the bets still cancels the unmatched remainder", async () => {
+    const { engine, exchange } = setup();
+    exchange.fill = 0;
+    exchange.failCurrentOrders = 1;
+    const result = await engine.execute("Bet 10 Euro Fill or Kill", W, [sel(101)]);
+    assert.deepEqual(exchange.cancelCalls, [{ marketId: W, betIds: ["F1"] }]);
+    assert.equal(exchange.remaining(exchange.orders[0]), 0, "nothing left resting");
+    assert.equal(result.status, true, explain(result));
+    assert.equal(result.outcome, "Executed");
+    assert.ok(result.messages.some((m) => /could not check the matching \(Betfair is unavailable\); cancelling whatever is unmatched/.test(m)));
+
+    // Every look fails: the bet is still killed after BetMatchingTimeout, and a failed read-back is only a note.
+    const blind = setup();
+    blind.exchange.fill = 0;
+    blind.exchange.failCurrentOrders = 6;
+    const killed = await blind.engine.execute("Bet 10 Euro Fill or Kill", W, [sel(101)]);
+    assert.deepEqual(blind.sleeps, [1000, 1000, 1000, 1000, 1000]);
+    assert.equal(blind.exchange.remaining(blind.exchange.orders[0]), 0);
+    assert.equal(killed.status, true, explain(killed));
+    assert.ok(killed.messages.some((m) => /could not re-read the bets after the cancel/.test(m)));
+  });
+
+  test("a cancel that fails is retried; if it keeps failing the result is status false naming the bet", async () => {
+    const once = setup();
+    once.exchange.fill = 0;
+    once.exchange.failCancels = 1;
+    const retried = await once.engine.execute("Bet 10 Euro Fill or Kill", W, [sel(101)]);
+    assert.equal(once.exchange.cancelCalls.length, 2);
+    assert.equal(once.exchange.remaining(once.exchange.orders[0]), 0);
+    assert.equal(retried.status, true, explain(retried));
+    assert.deepEqual(retried.cancelled.map((c) => [c.betId, c.status]), [["F1", "SUCCESS"]]);
+
+    const { engine, exchange } = setup();
+    exchange.fill = 0.4;
+    exchange.failCancels = 3;
+    const result = await engine.execute("Bet 10 Euro Fill or Kill", W, [sel(101)]);
+    assert.equal(exchange.cancelCalls.length, 3, "bounded retries");
+    assert.equal(result.status, false, explain(result));
+    assert.equal(result.outcome, "PartiallyExecuted");
+    assert.match(result.message!, /bet\(s\) F1 could not be cancelled after 3 attempts \(Betfair is unavailable\); it may still be resting on the exchange/);
+
+    const refused = setup();
+    refused.exchange.fill = 0;
+    refused.exchange.cancelStatus = () => "ERROR_IN_MATCHER";
+    const stuck = await refused.engine.execute("Bet 10 Euro Fill or Kill", W, [sel(101)]);
+    assert.equal(refused.exchange.cancelCalls.length, 3);
+    assert.equal(stuck.status, false);
+    assert.match(stuck.message!, /F1 could not be cancelled after 3 attempts \(F1: ERROR_IN_MATCHER\); it may still be resting/);
+  });
+});
+
 describe("tick offset", () => {
   test("offsets the matched entry Profit ticks better, sized for an equal profit", async () => {
     const { engine, exchange } = setup();
@@ -708,9 +832,9 @@ describe("tick offset", () => {
 });
 
 describe("dutching", () => {
-  test("RequiredProfit and TotalStake stakes; Dutch for 10 Euro", async () => {
+  test("RequiredProfit and TotalStake stakes; Dutch for 10 Euro is a total stake of 10", async () => {
     const { engine, exchange } = setup();
-    const profit = await engine.execute("Dutch for 10 Euro", W, [sel(101), sel(103)]);
+    const profit = await engine.execute("Dutch to profit 10 Euro", W, [sel(101), sel(103)]);
     assert.equal(profit.outcome, "Executed", explain(profit));
     const legs = exchange.sent();
     assert.deepEqual(legs.map((o) => [o.selectionId, o.side, o.price, o.size]), [
@@ -721,9 +845,21 @@ describe("dutching", () => {
     for (const leg of legs) assert.ok(Math.abs(leg.size * leg.price - total - 10) < 0.1);
     assert.deepEqual(profit.bets.map((b) => b.role), ["dutch", "dutch"]);
 
-    const before = exchange.placed.length;
-    await engine.execute("Dutch 10 Euro stake", W, [sel(101), sel(103)]);
-    assert.deepEqual(exchange.sent(before).map((o) => o.size), [5.94, 4.05]);
+    for (const name of ["Dutch 10 Euro stake", "Dutch for 10 Euro"]) {
+      const before = exchange.placed.length;
+      const result = await engine.execute(name, W, [sel(101), sel(103)]);
+      assert.deepEqual(exchange.sent(before).map((o) => o.size), [5.94, 4.05], name);
+      assert.ok(result.messages.some((m) => /total stake 9\.99/.test(m)), explain(result));
+    }
+  });
+
+  test("Dutch for 10 Euro stakes a total of 10 even on a book over 100%", async () => {
+    const { fake, engine, exchange } = setup();
+    fake.setOffers(102, [[1.5, 100]], [[1.52, 100]]);
+    const result = await engine.execute("Dutch for 10 Euro", W, [sel(101), sel(102), sel(103)]);
+    assert.equal(result.outcome, "Executed", explain(result));
+    const total = exchange.sent().reduce((t, o) => t + o.size, 0);
+    assert.ok(total <= 10 && total > 9.9, String(total));
   });
 
   test("atomic: one leg over MAX_STAKE places nothing", async () => {
@@ -744,7 +880,7 @@ describe("dutching", () => {
     const total = await engine.execute("Dutch 10 Euro stake", W, [sel(101), sel(103)]);
     assert.match(total.message!, /total stake 9\.99 .* exceeds MAX_LIABILITY 8/);
     fake.setOffers(102, [[1.5, 100]], [[1.52, 100]]);
-    const book = await engine.execute("Dutch for 10 Euro", W, [sel(101), sel(102)]);
+    const book = await engine.execute("Dutch to profit 10 Euro", W, [sel(101), sel(102)]);
     assert.match(book.message!, /100\.0% book/);
     for (const r of [maxOdds, small, total, book]) assert.equal(r.status, false);
     assert.equal(exchange.placed.length, 0);
@@ -888,7 +1024,7 @@ describe("closing positions", () => {
     await manual(exchange, "BACK", 3, 1);
     await manual(exchange, "LAY", 3, 0.95);
     const result = await engine.execute("Close Selection Bet Position", W, [sel(101)]);
-    assert.equal(result.status, true);
+    assert.equal(result.status, false, "a hedge was needed but not sent");
     assert.equal(result.outcome, "Skipped");
     assert.match(result.message!, /LAY 0\.05 @ 3\.05 was not sent: .*INVALID_BET_SIZE.*stays open/);
     assert.equal(exchange.placed.length, 2);
@@ -909,6 +1045,44 @@ describe("closing positions", () => {
     const result = await drift.engine.execute("Close Selection Bet Position", W, [sel(101)], { HedgingEnabled: false });
     assert.deepEqual(drift.exchange.sent(1).map((o) => [o.side, o.price, o.size]), [["LAY", 5, 6]], "greened up for -4 instead of -20 if it wins");
     assert.ok(result.messages.some((m) => /would increase the worst-case loss/.test(m)));
+  });
+
+  test("Close Selection with Profit/Loss/ClosePositionTimeSpan starts a bot unless ClosePositionImmediately is explicitly true", async () => {
+    const { fake, engine, exchange, bots } = setup();
+    await engine.execute("Bet 10 Euro", W, [sel(101)]);
+    const started = await engine.execute("Close Selection Bet Position", W, [sel(101)], { ProfitLossType: "Ticks", Profit: 3 });
+    assert.equal(started.outcome, "Started", explain(started));
+    assert.equal(exchange.placed.length, 1, "no hedge yet");
+    assert.equal(started.parameters.ClosePositionImmediately, false);
+    assert.ok(started.messages.some((m) => /green up on: profit target 3 ticks/.test(m)), explain(started));
+    await bots.tick();
+    assert.equal(exchange.placed.length, 1, "the lay at 3.05 is not 3 ticks in our favour");
+    fake.setOffers(101, [[2.92, 100]], [[2.94, 100]]);
+    await bots.tick();
+    assert.deepEqual(exchange.sent(1).map((o) => [o.side, o.price, o.size]), [["LAY", 2.94, 10.2]]);
+    assert.equal(bots.list()[0].status, "finished");
+
+    const timed = setup();
+    await timed.engine.execute("Bet 10 Euro", W, [sel(101)]);
+    const later = await timed.engine.execute("Close Selection Bet Position", W, [sel(101)], { ClosePositionTimeSpan: "-0:01:00" });
+    assert.equal(later.outcome, "Started", explain(later));
+    assert.equal(timed.exchange.placed.length, 1);
+
+    // Explicitly immediate: closed now, and the message says the targets were ignored.
+    const now = setup();
+    await now.engine.execute("Bet 10 Euro", W, [sel(101)]);
+    const closed = await now.engine.execute("Close Selection Bet Position", W, [sel(101)], { ClosePositionImmediately: true, ProfitLossType: "Ticks", Profit: 3 });
+    assert.equal(closed.outcome, "Executed", explain(closed));
+    assert.deepEqual(now.exchange.sent(1).map((o) => [o.side, o.price, o.size]), [["LAY", 3.05, 9.84]]);
+    assert.match(closed.message!, /ClosePositionImmediately is true, so the Profit\/Loss\/ClosePositionTimeSpan targets were ignored/);
+
+    // No targets: closed at once without that message.
+    const plain = setup();
+    await plain.engine.execute("Bet 10 Euro", W, [sel(101)]);
+    const greened = await plain.engine.execute("Close Selection Bet Position", W, [sel(101)]);
+    assert.equal(greened.outcome, "Executed");
+    assert.equal(greened.message, undefined);
+    assert.equal(plain.exchange.placed.length, 2);
   });
 
   test("Close Selection with ClosePositionImmediately false starts a bot, or skips when flat", async () => {
@@ -986,7 +1160,8 @@ describe("settings", () => {
       "CloseBetPosition.HedgingEnabled": true,
       "CloseBetPosition.ClosePositionTimeSpan": "-00:00:05",
     });
-    assert.deepEqual(engine.get("Dutch for 10 Euro").parameters, { DutchingType: "RequiredProfit", TargetValue: 10 });
+    assert.deepEqual(engine.get("Dutch for 10 Euro").parameters, { DutchingType: "TotalStake", TargetValue: 10 });
+    assert.deepEqual(engine.get("Dutch to profit 10 Euro").parameters, { DutchingType: "RequiredProfit", TargetValue: 10 });
     assert.equal(engine.get("Back Trade").parameters["CloseBetPosition.ClosePositionTimeSpan"], "-00:02:00");
     assert.equal(engine.get("Trailing Stop Loss 3 Ticks").template, "Trailing Stop Loss");
     assert.ok(engine.list().every((s) => s.builtIn));
@@ -999,6 +1174,64 @@ describe("settings", () => {
     assert.throws(() => engine.get("Bet 3 Euro"), /not found\. Available:/);
     assert.equal(engine.template("dutching").name, "Place Dutching Bets");
     assert.throws(() => engine.template("Scalping"), /Unknown strategy template "Scalping"\. Available: Place Bet/);
+  });
+
+  test("the settings the candlestick prompts execute exist and run", async () => {
+    const fs = await import("node:fs");
+    const names = new Set<string>();
+    for (const file of ["", "R2", "R3", "R4_Favourite"]) {
+      const text = fs.readFileSync(new URL(`../prompts/General/BetfairMarketAnalysisCandleStickData${file}.md`, import.meta.url), "utf8");
+      for (const m of text.matchAll(/ExecuteBfexplorerStrategySettings\w*\("([^"[\]]+)"/g)) names.add(m[1]);
+      for (const m of text.matchAll(/\|\s*"?([A-Z][a-z]+ [a-z]+ (?:strategy|trading))"?\s*\|/g)) names.add(m[1]);
+    }
+    assert.deepEqual([...names].sort(), [
+      "Back hedge strategy",
+      "Back scalping strategy",
+      "Conservative back strategy",
+      "Conservative lay strategy",
+      "Drift momentum trading",
+      "Lay fade strategy",
+      "Lay resistance trading",
+      "Steam momentum trading",
+      "Technical back strategy",
+    ]);
+    for (const name of names) {
+      const { engine, exchange, bots } = setup();
+      assert.equal(engine.get(name).name, name);
+      const momentum = /momentum/.test(name);
+      // The automated ones take the parameters the prompts compute (stake 6.44 from R4's example).
+      const overrides = momentum ? {} : { "OpenBetPosition.Stake": 6.44, "CloseBetPosition.Profit": 3, "CloseBetPosition.Loss": 30 };
+      const result = await engine.execute(name, W, [sel(101)], overrides);
+      assert.equal(result.outcome, "Started", `${name}: ${explain(result)}`);
+      const lay = /^(Lay|Conservative lay|Drift)/.test(name);
+      const [entry] = exchange.sent();
+      assert.deepEqual([entry.side, entry.price, entry.size], lay ? ["LAY", 3.05, momentum ? 10 : 3.14] : ["BACK", 3, momentum ? 10 : 6.44], name);
+      assert.equal(bots.list()[0].template, momentum ? "Trailing Stop Loss" : "Place Bet and Close Selection Bet Position", name);
+    }
+    // The trades close on Profit/Loss ticks (and 2 minutes before the off).
+    const { fake, engine, exchange, bots } = setup();
+    await engine.execute("Back scalping strategy", W, [sel(101)]);
+    assert.equal(engine.get("Lay fade strategy").parameters["OpenBetPosition.StakeType"], "Liability");
+    assert.equal(engine.get("Back hedge strategy").parameters["CloseBetPosition.ClosePositionTimeSpan"], "-00:02:00");
+    await bots.tick();
+    assert.equal(bots.list()[0].status, "running");
+    fake.setOffers(101, [[2.92, 100]], [[2.94, 100]]);
+    await bots.tick();
+    assert.deepEqual(exchange.sent(1).map((o) => [o.side, o.price, o.size]), [["LAY", 2.94, 10.2]]);
+    assert.match(bots.list()[0].log.map((l) => l.message).join("\n"), /3 ticks in our favour from 3 \(target 3\)/);
+  });
+
+  test("a custom setting that replaces a built-in also takes over the built-in's aliases", async () => {
+    const { engine, exchange } = setup();
+    engine.save("Back 2 Euro", "Place Bet", { BetType: "Back", Stake: 1 }, { overwrite: true });
+    assert.equal(engine.get("Bet 2 Euro").parameters.Stake, 1);
+    const result = await engine.execute("Bet 2 Euro", W, [sel(101)]);
+    assert.equal(result.strategyName, "Back 2 Euro");
+    assert.deepEqual(exchange.sent().map((o) => [o.side, o.size]), [["BACK", 1]]);
+    assert.equal(engine.remove("Bet 2 Euro"), true, "deleting by the alias removes the replacement");
+    assert.equal(engine.get("Bet 2 Euro").parameters.Stake, 2);
+    assert.equal(engine.get("Bet 2 Euro").builtIn, true);
+    assert.throws(() => engine.remove("Bet 2 Euro"), /built-in setting and cannot be deleted/);
   });
 
   test("create is create-only with per-item results", () => {

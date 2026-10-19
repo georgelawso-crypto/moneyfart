@@ -205,6 +205,7 @@ export class OrderDesk {
       size: order.size,
       persistenceType: order.persistenceType,
       reducesRisk: order.reducesRisk,
+      ...(order.customerOrderRef ? { customerOrderRef: order.customerOrderRef } : {}),
     }));
     let bets: PlacedBet[];
     try {
