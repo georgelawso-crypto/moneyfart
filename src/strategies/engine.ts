@@ -153,7 +153,7 @@ class Run {
     this.result.cancelled.push(...results);
     for (const r of results) {
       if (r.status === "SUCCESS") this.done++;
-      else if (r.status === "BET_TAKEN_OR_LAPSED") this.note(`Bet ${r.betId} was already matched or lapsed; nothing to cancel.`);
+      else if (r.status === "BET_TAKEN_OR_LAPSED") this.noop(`Bet ${r.betId} was already matched or lapsed; nothing to cancel.`);
       else this.problem(`Cancelling bet ${r.betId} failed (${r.status}).`);
     }
     for (const id of requested) if (!results.some((r) => r.betId === id)) this.problem(`No cancel report for bet ${id}; it may still be live.`);

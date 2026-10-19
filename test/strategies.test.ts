@@ -1114,6 +1114,18 @@ describe("cancel bets", () => {
     assert.equal(failed.status, false);
     assert.match(failed.message!, /ERROR_IN_MATCHER/);
   });
+
+  test("bets matched before the cancel arrives: nothing was needed, status true", async () => {
+    const { engine, exchange } = setup();
+    await manual(exchange, "BACK", 3.5, 5, 101, 0);
+    exchange.cancelStatus = (betId) => {
+      exchange.match(betId);
+      return "BET_TAKEN_OR_LAPSED";
+    };
+    const result = await engine.execute("Cancel Selection Bets", W, [sel(101)]);
+    assert.deepEqual([result.status, result.outcome], [true, "Skipped"], explain(result));
+    assert.equal(result.message, "Nothing needed to be done: Bet F1 was already matched or lapsed; nothing to cancel.");
+  });
 });
 
 describe("settings", () => {
