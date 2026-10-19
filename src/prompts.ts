@@ -100,6 +100,8 @@ const VARIANT_NAMES: Record<string, BfexplorerToolName> = {
   GetStrategyTemplate: "get_strategy_template",
   CreateStrategySettings: "create_strategy_settings",
   GetAIAgentDataContextFeedback: "get_ai_agent_data_context_feedback",
+  // Shortened in the upstream tool list (docs/Automation/UnderstandingAvailableTools.md).
+  getAiAgentDataContextFeed: "get_ai_agent_data_context_feedback",
   GetAvailableDataContextProviders: "get_available_data_context_providers",
   GetAllBetResults: "get_all_bet_results",
   OpenMarket: "open_market",
@@ -288,6 +290,11 @@ const EXECUTE_WORD = /\bexecut/i;
 
 const metaList = (meta: Meta, key: string): string[] => (Array.isArray(meta[key]) ? (meta[key] as string[]) : []);
 const unique = (values: string[]) => [...new Set(values)];
+/** Unique case-insensitively; the first spelling wins. */
+const uniqueIgnoreCase = (values: string[]) => {
+  const seen = new Set<string>();
+  return values.filter((v) => !seen.has(v.toLowerCase()) && !!seen.add(v.toLowerCase()));
+};
 
 export class PromptLibrary {
   readonly entries: PromptEntry[];
@@ -350,15 +357,16 @@ export class PromptLibrary {
 
     const declared = metaList(meta, "data_contexts").map((name) => KNOWN_CONTEXTS.get(name.toLowerCase()) ?? name);
     const referenced = [...body.matchAll(IDENTIFIER)].map(([token]) => providerName(token)).filter((n): n is string => !!n);
-    const dataContexts = unique([...declared, ...referenced]);
-    const storedDataContexts = unique([...dataContexts.filter((n) => AI_CONTEXT_NAME.test(n) && !providerName(n)), ...stored]);
+    const dataContexts = uniqueIgnoreCase([...declared, ...referenced]);
+    const storedDataContexts = uniqueIgnoreCase([...dataContexts.filter((n) => AI_CONTEXT_NAME.test(n) && !providerName(n)), ...stored]);
 
+    const storedKeys = new Set(storedDataContexts.map((n) => n.toLowerCase()));
     const missingDataContexts: string[] = [];
     const partialDataContexts: string[] = [];
     for (const name of dataContexts) {
       const status = this.providerStatus(name);
       if (status === "partial") partialDataContexts.push(name);
-      else if (status === "unavailable" || (status === "unknown" && !storedDataContexts.includes(name))) missingDataContexts.push(name);
+      else if (status === "unavailable" || (status === "unknown" && !storedKeys.has(name.toLowerCase()))) missingDataContexts.push(name);
     }
     const missingTools = tools.filter((t) => !this.implemented.has(t));
 
@@ -384,7 +392,11 @@ export class PromptLibrary {
     };
   }
 
-  /** A prompt by id ("HorseRacing/X"), basename ("X") or MCP prompt name; case-insensitive. */
+  /**
+   * A prompt by id ("HorseRacing/X"), basename ("X") or MCP prompt name; case-insensitive.
+   * An ambiguous basename or path suffix gives undefined rather than an arbitrary one of the prompts
+   * (HorseRacing/HorseRacingEVAnalysisPrompt only analyses; its Templates namesake places bets).
+   */
   get(id: string): PromptEntry | undefined {
     const key = id
       .trim()
@@ -394,11 +406,18 @@ export class PromptLibrary {
       .replace(/\.md$/i, "")
       .toLowerCase();
     if (!key) return undefined;
-    return this.byId.get(key) ?? this.byName.get(key) ?? this.entries.find((e) => e.id.toLowerCase().endsWith(`/${key}`));
+    const exact = this.byId.get(key) ?? this.byName.get(key);
+    if (exact) return exact;
+    const suffixed = this.entries.filter((e) => e.id.toLowerCase().endsWith(`/${key}`));
+    return suffixed.length === 1 ? suffixed[0] : undefined;
   }
 
   search(options: { query?: string; category?: string; onlyFullySupported?: boolean; executesBets?: boolean; limit?: number }) {
-    const terms = (options.query ?? "").toLowerCase().split(/\s+/).filter(Boolean);
+    // A tool name in any spelling searches for the canonical tool, which is what e.tools holds.
+    const terms = (options.query ?? "")
+      .split(/\s+/)
+      .filter(Boolean)
+      .map((term) => canonicalToolName(term) ?? term.toLowerCase());
     const scored = this.entries
       .filter((e) => !options.category || e.category.toLowerCase() === options.category.toLowerCase())
       .filter((e) => !options.onlyFullySupported || e.compatibility === "full")

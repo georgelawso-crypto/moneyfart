@@ -140,6 +140,22 @@ describe("prompt library loading", () => {
     assert.equal(library.get("NoSuchPrompt"), undefined);
     assert.equal(library.get(""), undefined);
   });
+
+  test("get() refuses an ambiguous basename instead of picking one of the prompts", () => {
+    // HorseRacing/HorseRacingEVAnalysisPrompt only analyses; Templates/HorseRacingEVAnalysisPrompt places bets.
+    assert.equal(entry("HorseRacing/HorseRacingEVAnalysisPrompt").executesBets, false);
+    assert.equal(entry("Templates/HorseRacingEVAnalysisPrompt").executesBets, true);
+    assert.equal(library.get("HorseRacingEVAnalysisPrompt"), undefined);
+    assert.equal(library.get("horseracingevanalysisprompt.md"), undefined);
+    const lib = fixture({
+      "A/Sub/X.md": "# X\n\nFirst prompt with the nested basename X.",
+      "B/Sub/X.md": "# X\n\nSecond prompt with the nested basename X.",
+      "C/Y.md": "# Y\n\nA prompt with a unique basename Y.",
+    });
+    assert.equal(lib.get("Sub/X"), undefined, "an ambiguous path suffix");
+    assert.equal(lib.get("A/Sub/X")?.id, "A/Sub/X");
+    assert.equal(lib.get("Y")?.id, "C/Y");
+  });
 });
 
 describe("tool names", () => {
@@ -226,6 +242,9 @@ describe("tool names", () => {
     assert.equal(canonicalToolName(" get_active_market "), "get_active_market");
     assert.equal(canonicalToolName("get_active_betfair_market"), "get_active_market");
     assert.equal(canonicalToolName("execute_bfexplorer_strategy_settings_on_selections"), "execute_strategy_settings_on_selections");
+    // The upstream tool list (docs/Automation/UnderstandingAvailableTools.md) shortens this one.
+    assert.equal(LEGACY_TOOL_NAMES.getAiAgentDataContextFeed, "get_ai_agent_data_context_feedback");
+    assert.equal(canonicalToolName("getAiAgentDataContextFeed"), "get_ai_agent_data_context_feedback");
   });
 
   test("canonicalToolName rejects names that are not BFExplorer tools", () => {
@@ -388,6 +407,19 @@ describe("per-prompt analysis", () => {
     assert.deepEqual(entry("HorseRacing/NotContexts", lib).dataContexts, []);
   });
 
+  test("data contexts are de-duplicated case-insensitively (first spelling wins)", () => {
+    const lib = fixture(
+      {
+        "HorseRacing/Dup.md":
+          "---\ndata_contexts: [SkyBetBookmakersOdds, brandNewDataForHorses]\n---\n# Dup\n\nRequest SkybetBookmakersOdds, BrandNewDataForHorses and SkyBetBookmakersOdds.",
+      },
+      { providerStatus: () => "unavailable" },
+    );
+    const e = entry("HorseRacing/Dup", lib);
+    assert.deepEqual(e.dataContexts, ["SkyBetBookmakersOdds", "brandNewDataForHorses"]);
+    assert.deepEqual(e.missingDataContexts, ["SkyBetBookmakersOdds", "brandNewDataForHorses"]);
+  });
+
   test("AI-agent contexts a prompt stores or reads back are recognised", () => {
     assert.deepEqual(entry("HorseRacing/HorseRacingStrategyR1_Analyze").storedDataContexts, ["HorseRacingStrategyR1_Analysis"]);
     assert.ok(entry("HorseRacing/HorseRacingStrategyR5_Ideas").storedDataContexts.includes("HorseRacingR5_Analysis"));
@@ -524,6 +556,16 @@ describe("search and summary", () => {
     assert.equal(library.search({}).prompts.length, 25);
     const bySnakeTool = library.search({ query: "execute_strategy_settings_with_parameters", limit: 200 });
     assert.ok(bySnakeTool.prompts.some((p) => p.id === "HorseRacing/HorsesBetfairRaceInfoDataVDWTradeV4"));
+    // Tool names in any spelling find the prompts that use the tool, whatever spelling those use.
+    const byLegacyTool = library.search({ query: "ExecuteBfexplorerStrategySettingsWithParameters", limit: 200 });
+    assert.ok(byLegacyTool.prompts.some((p) => p.id === "HorseRacing/HorsesBetfairRaceInfoDataVDWTradeV4"), "snake_case prompt found by legacy name");
+    assert.ok(byLegacyTool.prompts.every((p) => p.tools.includes("execute_strategy_settings_with_parameters")));
+    const feedback = library.search({ query: "GetAIAgentDataContextFeedback", limit: 200 });
+    assert.ok(feedback.prompts.some((p) => p.id === "HorseRacing/HorseRacingStrategyR1_Analyze"));
+    assert.deepEqual(
+      library.search({ query: "getActiveMarket", limit: 200 }).prompts.map((p) => p.id),
+      library.search({ query: "get_active_market", limit: 200 }).prompts.map((p) => p.id),
+    );
     const combined = library.search({ category: "HorseRacing", executesBets: true, onlyFullySupported: true, query: "favourite", limit: 200 });
     assert.ok(combined.prompts.every((p) => p.category === "HorseRacing" && p.executesBets && p.compatibility === "full"));
     assert.ok(combined.prompts.some((p) => p.id === "HorseRacing/HorseRacingBetfairSpDataR1_Favourite_Silent"));
