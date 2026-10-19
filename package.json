@@ -1,0 +1,36 @@
+{
+  "name": "betfair-ai-trading-connector",
+  "version": "0.1.0",
+  "private": true,
+  "description": "MCP connector that brings the BetfairAiTrading toolkit (BFExplorer-compatible tools, data contexts, strategies and prompt library) to Claude, backed directly by the Betfair Exchange API.",
+  "type": "module",
+  "bin": {
+    "betfair-ai-trading-connector": "dist/index.js"
+  },
+  "main": "dist/index.js",
+  "files": [
+    "dist",
+    "prompts"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "start:stdio": "node dist/index.js --stdio",
+    "dev": "tsx src/index.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "tsx --test test/*.test.ts",
+    "sync-prompts": "node scripts/sync-prompts.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3"
+  }
+}
