@@ -27,6 +27,8 @@ export interface DataContextEnvelope {
   data?: Record<string, unknown>;
   /** Connector-only: requested contexts that could not be produced, with reasons. */
   unavailableDataContexts?: Record<string, string>;
+  /** Connector-only: requested contexts that were produced but cover less than BFExplorer's, with what is missing. */
+  partialDataContexts?: Record<string, string>;
   /** Connector-only: how much price history this connector has recorded for the market. */
   recording?: {
     since?: string;
