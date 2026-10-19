@@ -80,6 +80,7 @@ function findRunner(book: MarketBook, ref: SelectionRef): Runner | undefined {
 }
 
 const activeKeys = (book: MarketBook) => book.runners.filter((r) => r.status === "ACTIVE").map(keyOf);
+const isRemoved = (r: Runner) => r.status === "REMOVED" || r.status === "REMOVED_VACANT";
 
 // ------------------------------------------------------------------ exposure
 
@@ -359,6 +360,9 @@ export class PaperExchange implements Exchange {
     const sel = (market.selections[key] ??= { levels: {} });
     // Baseline for a selection without live orders: only trades after this book are evidence for the new order.
     if (!sel.traded) tradedGrowth(sel, runner);
+    // Removals the book already shows happened before this order: they must never lapse or reduce it,
+    // whatever removalDate says (it can be missing, or ahead of our clock).
+    const removals = book.runners.filter(isRemoved).map(keyOf);
     const order: PaperOrder = {
       betId: this.nextBetId(),
       marketId: book.marketId,
@@ -384,7 +388,7 @@ export class PaperExchange implements Exchange {
       marketType: catalogue.description?.marketType,
       eachWayDivisor: catalogue.description?.eachWayDivisor,
       numberOfWinners: book.numberOfWinners,
-      meta: {},
+      meta: removals.length ? { removals } : {},
     };
     for (const fill of takeLiquidity(sel, runner, req.side, req.price, req.size)) addFill(order, fill.price, fill.size, placedAt);
     if (sizeRemaining(order) > 0) {
@@ -540,7 +544,7 @@ export class PaperExchange implements Exchange {
    */
   private applyRemovals(book: MarketBook, orders: PaperOrder[], now: string) {
     for (const runner of book.runners) {
-      if (runner.status !== "REMOVED" && runner.status !== "REMOVED_VACANT") continue;
+      if (!isRemoved(runner)) continue;
       const removed = keyOf(runner);
       const declared = Date.parse(runner.removalDate ?? "");
       const removedAt = Number.isFinite(declared) ? declared : Date.parse(now);

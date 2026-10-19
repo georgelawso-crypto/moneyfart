@@ -569,6 +569,28 @@ describe("paper: non-runners", () => {
     assert.equal((await paper.accountFunds()).balance, 1010.45);
     assert.equal(state.paper.settlements.length, 1);
   });
+
+  test("orders placed while the book already shows a removal are unaffected by it (no removalDate, or clock skew)", async () => {
+    for (const removalDate of [undefined, "skewed"]) {
+      const { fake, place, paper, clock, order } = setup();
+      const [early] = await place([back(101, 3.0, 10, "PERSIST")]);
+      clock.t += 10_000;
+      // Betfair's clock may run ahead of ours, or the book may carry no removal time at all.
+      fake.setRunner(102, { status: "REMOVED", adjustmentFactor: 30, removalDate: removalDate && new Date(clock.t + 60_000).toISOString() });
+      await paper.currentOrders();
+      clock.t += 10_000;
+      const [matched, resting] = await place([back(103, 4.4, 10, "PERSIST"), back(103, 5.0, 10, "PERSIST")]);
+      assert.equal(matched.sizeMatched, 10);
+      clock.t += 10_000;
+      await paper.currentOrders();
+      await paper.currentOrders();
+      close(order(matched.betId!).fills[0].price, 4.4);
+      assert.equal(order(matched.betId!).fills[0].originalPrice, undefined, `removalDate ${removalDate}`);
+      assert.equal(order(resting.betId!).sizeLapsed, 0, "an order placed after the removal is not cancelled by it");
+      assert.equal((await paper.currentOrders()).find((v) => v.betId === resting.betId)?.status, "EXECUTABLE");
+      if (!removalDate) close(order(early.betId!).fills[0].price, 2.1); // the earlier bet is still reduced
+    }
+  });
 });
 
 describe("paper: settlement", () => {
