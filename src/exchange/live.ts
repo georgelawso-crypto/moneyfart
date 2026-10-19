@@ -319,7 +319,8 @@ export class LiveExchange implements Exchange {
     }
     let total = 0;
     for (const value of byMarket.values()) total += value;
-    return total;
+    // A sum of whole pennies: rounding only removes float noise (0.1 + 0.2 + 0.3 = 0.6000000000000001).
+    return round(total, 2) ?? 0;
   }
 
   /** listCurrentOrders over every page, with market ids split into Betfair-sized groups; de-duplicated by betId. */

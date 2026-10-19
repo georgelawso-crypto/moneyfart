@@ -374,6 +374,16 @@ test("placeOrders has its own, longer timeout", async () => {
   await assert.rejects(short.placeOrders({ marketId: "1.1", instructions: [] }), (error: BetfairApiError) => error.code === "TIMEOUT" && /40 ms/.test(error.message));
 });
 
+test("a placeOrders timeout of 0 means no timeout, like every other timeout setting", async () => {
+  const { fetchImpl } = fakeFetch((_url, init) => slow(100, init, rpcResult({ status: "SUCCESS", marketId: "1.1", instructionReports: [] })));
+  const client = new BetfairClient(
+    betfairConfig({ BETFAIR_SESSION_TOKEN: "tok", BETFAIR_REQUEST_TIMEOUT_MS: "20", BETFAIR_PLACE_ORDERS_TIMEOUT_MS: "0" }),
+    fetchImpl,
+  );
+  const report = await client.placeOrders({ marketId: "1.1", instructions: [] });
+  assert.equal(report.status, "SUCCESS");
+});
+
 test("outcomeUnknown separates 'may have happened' from 'rejected'", () => {
   for (const code of ["TIMEOUT", "NETWORK_ERROR", "HTTP_503", "HTTP_200", "TIMEOUT_ERROR", "UNEXPECTED_ERROR", "UNKNOWN_ERROR"]) {
     assert.equal(outcomeUnknown(new BetfairApiError("x", code)), true, code);

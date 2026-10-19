@@ -767,6 +767,15 @@ describe("LiveExchange reads", () => {
     );
   });
 
+  test("settledBets commission is a whole number of pennies (no float noise from summing markets)", async () => {
+    const { fake, live } = setup();
+    const markets = ["1.1", "1.2", "1.3"];
+    // Per-market commissions 0.1 + 0.2 + 0.3: a plain float sum gives 0.6000000000000001.
+    [0.1, 0.2, 0.3].forEach((commission, i) => fake.cleared.push(clearedBet(i, { marketId: markets[i], commission })));
+    const settled = await live.settledBets(new Date(Date.now() - 86400_000), markets);
+    assert.equal(settled.commission, 0.6);
+  });
+
   test("settledBets stops at 10000 bets and says the list is truncated", async () => {
     const { fake, live } = setup();
     for (let i = 0; i < 10500; i++) fake.cleared.push(clearedBet(i, { marketId: i < 10000 ? WIN_MARKET : PLACE_MARKET, commission: 0.01 }));

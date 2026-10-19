@@ -489,9 +489,9 @@ export class BetfairClient implements BetfairApi {
     return this.call<MarketBook[]>("betting", "listMarketBook", args);
   }
 
-  /** Uses BETFAIR_PLACE_ORDERS_TIMEOUT_MS: in-play bets wait for the market's bet delay before Betfair answers. */
+  /** Uses BETFAIR_PLACE_ORDERS_TIMEOUT_MS (0 = none): in-play bets wait for the market's bet delay before Betfair answers. */
   placeOrders(args: Parameters<BetfairApi["placeOrders"]>[0]) {
-    return this.call<PlaceExecutionReport>("betting", "placeOrders", args, this.config.placeOrdersTimeoutMs || this.config.requestTimeoutMs);
+    return this.call<PlaceExecutionReport>("betting", "placeOrders", args, this.config.placeOrdersTimeoutMs ?? this.config.requestTimeoutMs);
   }
 
   cancelOrders(args: Parameters<BetfairApi["cancelOrders"]>[0]) {
