@@ -1,6 +1,202 @@
 import fs from "node:fs";
 import path from "node:path";
+import type { ToolNaming } from "./config.js";
 import { BFEXPLORER_ONLY_CONTEXTS } from "./contexts/bfexplorerOnly.js";
+import { assertMarketId } from "./format.js";
+
+// ---------------------------------------------------------------- tool names
+
+/** BFExplorer's 25 MCP tools under their current snake_case wire names, in BFExplorer's order. */
+export const BFEXPLORER_TOOL_NAMES = [
+  "get_monitored_markets",
+  "get_data_context",
+  "create_strategy_settings",
+  "get_strategy_setting",
+  "execute_strategy_settings_on_selections",
+  "set_ai_agent_data_context_for_market",
+  "execute_strategy_settings",
+  "execute_strategy_settings_with_parameters",
+  "get_all_data_context_for_market",
+  "open_market",
+  "get_all_strategy_templates",
+  "get_my_favourite_bet_event_markets",
+  "execute_application_command",
+  "get_active_market",
+  "get_all_strategy_settings",
+  "get_market",
+  "get_available_data_context_providers",
+  "activate_market_selection",
+  "get_data_context_for_market_selection",
+  "get_all_bet_results",
+  "get_strategy_template",
+  "get_ai_agent_data_context_feedback",
+  "get_application_commands",
+  "get_my_favourite_bet_events",
+  "execute_console_script",
+] as const;
+
+export type BfexplorerToolName = (typeof BFEXPLORER_TOOL_NAMES)[number];
+
+/** The PascalCase name each tool is registered under with TOOL_NAMES=legacy (the spelling most library prompts use). */
+export const PRIMARY_LEGACY_NAMES: Record<BfexplorerToolName, string> = {
+  get_monitored_markets: "GetBetfairMonitoredMarkets",
+  get_data_context: "GetDataContext",
+  create_strategy_settings: "CreateStrategySettings",
+  get_strategy_setting: "GetBfexplorerStrategySetting",
+  execute_strategy_settings_on_selections: "ExecuteBfexplorerStrategySettingsOnSelections",
+  set_ai_agent_data_context_for_market: "SetAIAgentDataContextForBetfairMarket",
+  execute_strategy_settings: "ExecuteBfexplorerStrategySettings",
+  execute_strategy_settings_with_parameters: "ExecuteBfexplorerStrategySettingsWithParameters",
+  get_all_data_context_for_market: "GetAllDataContextForMarket",
+  open_market: "OpenMarket",
+  get_all_strategy_templates: "GetAllBfexplorerStrategyTemplates",
+  get_my_favourite_bet_event_markets: "GetMyFavouriteBetEventMarkets",
+  execute_application_command: "ExecuteApplicationAction",
+  get_active_market: "GetActiveMarket",
+  get_all_strategy_settings: "GetAllBfexplorerStrategySettings",
+  get_market: "GetMarket",
+  get_available_data_context_providers: "GetAvailableDataContextProviders",
+  activate_market_selection: "ActivateBetfairMarketSelection",
+  get_data_context_for_market_selection: "GetDataContextForMarketSelection",
+  get_all_bet_results: "GetAllBetResults",
+  get_strategy_template: "GetStrategyTemplate",
+  get_ai_agent_data_context_feedback: "GetAIAgentDataContextFeedback",
+  get_application_commands: "GetApplicationActions",
+  get_my_favourite_bet_events: "GetMyFavouriteBetEvents",
+  execute_console_script: "ExecuteConsoleScript",
+};
+
+/** Connector-only tools the prompt notes mention, with their legacy names. */
+const CONNECTOR_LEGACY_NAMES: Record<string, string> = { find_markets: "FindMarkets" };
+
+const VARIANT_NAMES: Record<string, BfexplorerToolName> = {
+  GetActiveMarket: "get_active_market",
+  GetActiveBetfairMarket: "get_active_market",
+  GetAllDataContextForMarket: "get_all_data_context_for_market",
+  GetAllDataContextForBetfairMarket: "get_all_data_context_for_market",
+  GetDataContextForMarket: "get_all_data_context_for_market",
+  GetDataContextForMarketSelection: "get_data_context_for_market_selection",
+  ExecuteBfexplorerStrategySettings: "execute_strategy_settings",
+  ExecuteStrategySettings: "execute_strategy_settings",
+  execute_bfexplorer_strategy_settings: "execute_strategy_settings",
+  ExecuteBfexplorerStrategySettingsWithParameters: "execute_strategy_settings_with_parameters",
+  ExecuteStrategySettingsWithParameters: "execute_strategy_settings_with_parameters",
+  ExecuteBfexplorerStrategySettingsOnSelections: "execute_strategy_settings_on_selections",
+  ExecuteStrategySettingsOnSelections: "execute_strategy_settings_on_selections",
+  SetAIAgentDataContextForBetfairMarket: "set_ai_agent_data_context_for_market",
+  SetAIAgentDataContextForMarket: "set_ai_agent_data_context_for_market",
+  ActivateBetfairMarketSelection: "activate_market_selection",
+  ActivateMarketSelection: "activate_market_selection",
+  GetBetfairMonitoredMarkets: "get_monitored_markets",
+  GetMonitoredMarkets: "get_monitored_markets",
+  GetAllBfexplorerStrategySettings: "get_all_strategy_settings",
+  GetAllStrategySettings: "get_all_strategy_settings",
+  GetAllBfexplorerStrategyTemplates: "get_all_strategy_templates",
+  GetAllStrategyTemplates: "get_all_strategy_templates",
+  GetBfexplorerStrategyTemplates: "get_all_strategy_templates",
+  GetStrategyTemplates: "get_all_strategy_templates",
+  GetBfexplorerStrategySetting: "get_strategy_setting",
+  GetStrategySetting: "get_strategy_setting",
+  GetStrategyTemplate: "get_strategy_template",
+  CreateStrategySettings: "create_strategy_settings",
+  GetAIAgentDataContextFeedback: "get_ai_agent_data_context_feedback",
+  GetAvailableDataContextProviders: "get_available_data_context_providers",
+  GetAllBetResults: "get_all_bet_results",
+  OpenMarket: "open_market",
+  GetMarket: "get_market",
+  GetDataContext: "get_data_context",
+  GetApplicationActions: "get_application_commands",
+  GetApplicationCommands: "get_application_commands",
+  ExecuteApplicationAction: "execute_application_command",
+  ExecuteApplicationCommand: "execute_application_command",
+  GetMyFavouriteBetEvents: "get_my_favourite_bet_events",
+  GetMyFavouriteBetEventMarkets: "get_my_favourite_bet_event_markets",
+  ExecuteConsoleScript: "execute_console_script",
+};
+
+const camelCase = (snake: string) => snake.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
+const lowerFirst = (name: string) => name.charAt(0).toLowerCase() + name.slice(1);
+
+/**
+ * Every older, PascalCase, variant and camelCase (as Claude/Cherry Studio render them) spelling of the
+ * BFExplorer tools seen in the prompts and docs, mapped to the current snake_case tool name.
+ */
+export const LEGACY_TOOL_NAMES: Record<string, string> = (() => {
+  const names: Record<string, string> = { ...VARIANT_NAMES };
+  for (const snake of BFEXPLORER_TOOL_NAMES) names[camelCase(snake)] ??= snake;
+  for (const [name, snake] of Object.entries(VARIANT_NAMES)) if (/^[A-Z]/.test(name)) names[lowerFirst(name)] ??= snake;
+  return names;
+})();
+
+const TOOL_PREFIX = /^(?:mcp_+)?bfexplorerapp_+/i;
+const normaliseToolName = (name: string) => name.trim().replace(TOOL_PREFIX, "").replace(/[_-]/g, "").toLowerCase();
+
+const TOOL_INDEX = new Map<string, BfexplorerToolName>([
+  ...Object.entries(LEGACY_TOOL_NAMES).map(([name, snake]) => [normaliseToolName(name), snake as BfexplorerToolName] as const),
+  ...BFEXPLORER_TOOL_NAMES.map((snake) => [normaliseToolName(snake), snake] as const),
+]);
+
+/**
+ * The snake_case BFExplorer tool a name refers to, in any era or client spelling
+ * (GetActiveBetfairMarket, getActiveMarket, BfexplorerApp__get_active_market, mcp_bfexplorerapp_get_active_market...).
+ * Undefined for anything that is not a BFExplorer tool (e.g. PlaceBet, a strategy word).
+ */
+export function canonicalToolName(name: string): string | undefined {
+  return TOOL_INDEX.get(normaliseToolName(name));
+}
+
+/** The name the server registers a tool under for a TOOL_NAMES setting ("both" registers snake and primary legacy). */
+export function actualToolName(snake: string, naming: ToolNaming): string {
+  if (naming !== "legacy") return snake;
+  return PRIMARY_LEGACY_NAMES[snake as BfexplorerToolName] ?? CONNECTOR_LEGACY_NAMES[snake] ?? snake;
+}
+
+function isRegisteredSpelling(spelling: string, snake: string, naming: ToolNaming): boolean {
+  const legacy = PRIMARY_LEGACY_NAMES[snake as BfexplorerToolName];
+  if (naming === "snake") return spelling === snake;
+  if (naming === "legacy") return spelling === legacy;
+  return spelling === snake || spelling === legacy;
+}
+
+const EXECUTE_TOOLS: ReadonlySet<string> = new Set(["execute_strategy_settings", "execute_strategy_settings_with_parameters", "execute_strategy_settings_on_selections"]);
+const AI_CONTEXT_TOOLS: ReadonlySet<string> = new Set(["set_ai_agent_data_context_for_market", "get_ai_agent_data_context_feedback"]);
+
+// ---------------------------------------------------------------- data contexts
+
+/** Contexts this connector reproduces from Betfair data. */
+const BETFAIR_CONTEXTS = [
+  "MarketSelectionsCandleStickData",
+  "MarketSelectionsPriceHistoryData",
+  "MarketSelectionsTradedPricesData",
+  "MarketSelectionsPriceMetricData",
+  "WeightOfMoneyData",
+  "BetfairSpData",
+  "HorsesBaseBetfairFormData",
+  "HorsesBetfairRaceInfoData",
+  "HorseRacingWinToBePlacedData",
+];
+const KNOWN_CONTEXTS = new Map([...BETFAIR_CONTEXTS, ...Object.keys(BFEXPLORER_ONLY_CONTEXTS)].map((name) => [name.toLowerCase(), name]));
+/** BFExplorer's provider naming families, for providers not listed by name. */
+const PROVIDER_NAME = /^(?:(?:MarketSelections|WeightOfMoney|BetfairSp|HorsesBase)\w*Data|\w+DataForHorses|HorsesNigels[A-Z]\w*|\w+BookmakersOdds|Db[A-Z]\w*Results)$/;
+/** Names prompts give the JSON they store with set_ai_agent_data_context_for_market (HorseRacingR4_Analysis, ...EVAnalysisResults). */
+const AI_CONTEXT_NAME = /(?:Analysis|Results|DecisionData)$/;
+
+function providerName(token: string): string | undefined {
+  return KNOWN_CONTEXTS.get(token.toLowerCase()) ?? (PROVIDER_NAME.test(token) ? token : undefined);
+}
+
+const isBfexplorerOnly = (name: string) => Object.keys(BFEXPLORER_ONLY_CONTEXTS).some((n) => n.toLowerCase() === name.toLowerCase());
+
+// ---------------------------------------------------------------- prompt entries
+
+export type ProviderStatus = "available" | "partial" | "unavailable" | "unknown";
+
+export interface PromptCapabilities {
+  /** snake_case BFExplorer tools the server implements (default: all but execute_console_script). */
+  implementedTools?: string[];
+  /** Status of a data-context provider by request name (default: BFExplorer-only names unavailable, else available). */
+  providerStatus?: (name: string) => ProviderStatus;
+}
 
 export interface PromptEntry {
   id: string;
@@ -9,35 +205,67 @@ export interface PromptEntry {
   type?: string;
   tags: string[];
   description: string;
+  /** Canonical snake_case BFExplorer tools referenced in the body or the frontmatter mcp_tools. */
+  tools: string[];
+  /** Tool spellings exactly as they appear in the body, mapped to the snake_case tool (first occurrence order). */
+  toolSpellings: Record<string, string>;
   dataContexts: string[];
-  /** Data contexts the prompt uses that only BFExplorer can provide. */
+  /** AI-agent contexts the prompt stores or reads back itself (never counted as missing). */
+  storedDataContexts: string[];
+  /** Referenced tools the server does not implement. */
+  missingTools: string[];
+  /** Data contexts that will come back as unavailable. */
   missingDataContexts: string[];
+  /** Data contexts this connector only partly reproduces. */
+  partialDataContexts: string[];
+  compatibility: "full" | "partial";
+  /** True when the prompt can place bets (any execute_strategy_settings* tool, or an instruction to execute a betting strategy). */
   executesBets: boolean;
   body: string;
 }
 
-function parseFrontmatter(source: string): { meta: Record<string, string | string[]>; body: string } {
-  const match = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/.exec(source);
-  if (!match) return { meta: {}, body: source };
-  const meta: Record<string, string | string[]> = {};
+/** Recorded runs and logs shipped among the prompts; they are not prompts. */
+export const EXCLUDED_PROMPTS = ["HorseRacing/HorsesBetfairRaceInfoDataBetV1-calibration-log", "HorseRacing/HorsesBetfairRaceInfoDataTradeV1"];
+
+export function isExcludedPrompt(id: string): boolean {
+  const key = id.toLowerCase();
+  return EXCLUDED_PROMPTS.some((excluded) => excluded.toLowerCase() === key) || key.endsWith("-log");
+}
+
+type Meta = Record<string, string | string[]>;
+
+const unquote = (value: string) => value.trim().replace(/^["']|["']$/g, "");
+
+export function parseFrontmatter(source: string): { meta: Meta; body: string } {
+  const match = /^\uFEFF?---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(source);
+  if (!match) return { meta: {}, body: source.replace(/^\uFEFF/, "") };
+  const meta: Meta = {};
+  let listKey: string | undefined;
   for (const line of match[1].split(/\r?\n/)) {
+    const item = /^\s+-\s+(.*)$/.exec(line);
+    if (item && listKey) {
+      const list = meta[listKey];
+      if (Array.isArray(list)) list.push(unquote(item[1]));
+      continue;
+    }
     const kv = /^([A-Za-z_][\w-]*):\s*(.*)$/.exec(line);
+    listKey = undefined;
     if (!kv) continue;
     const value = kv[2].trim();
     if (value.startsWith("[") && value.endsWith("]")) {
-      meta[kv[1]] = value
-        .slice(1, -1)
-        .split(",")
-        .map((v) => v.trim().replace(/^["']|["']$/g, ""))
-        .filter(Boolean);
+      meta[kv[1]] = value.slice(1, -1).split(",").map(unquote).filter(Boolean);
+    } else if (!value) {
+      // A YAML block list may follow ("key:" then "  - item" lines).
+      meta[kv[1]] = [];
+      listKey = kv[1];
     } else {
-      meta[kv[1]] = value.replace(/^["']|["']$/g, "");
+      meta[kv[1]] = unquote(value);
     }
   }
   return { meta, body: source.slice(match[0].length) };
 }
 
-function firstParagraph(body: string): string {
+export function firstParagraph(body: string): string {
   for (const block of body.split(/\r?\n\s*\r?\n/)) {
     const text = block
       .split(/\r?\n/)
@@ -51,66 +279,132 @@ function firstParagraph(body: string): string {
   return "";
 }
 
-const KNOWN_CONTEXT = /\b([A-Z][A-Za-z]+(?:Data|DataForHorses))\b/g;
-const BET_TOOLS = /ExecuteBfexplorerStrategySettings|ExecuteStrategySettings|PlaceBet/;
+const IDENTIFIER = /\b[A-Za-z]\w*/g;
+const QUOTED_NAME = /["“'`]([A-Z]\w*)["”'`]/g;
+/** A quoted betting strategy name: "Bet 10 Euro", "Lay Trade", "Trade x profit", "Dutch to profit 10 Euro"... */
+const BET_STRATEGY_NAME =
+  /["“'`](?:(?:Bet|Back|Lay)\s+(?:\d+(?:[.,]\d+)?\s*(?:Euro|EUR|GBP|USD|AUD|£|€)|[£€$]\s*\d)[^"”'`\n]*|(?:Back|Lay)\s+(?:Trade|hedge|fade)\b[^"”'`\n]*|Trade\s+[^"”'`\n]*\b(?:profit|ticks?|loss)\b[^"”'`\n]*|Trade\s+\d+\/\d+|Dutch\s+(?:to|for)\b[^"”'`\n]*)["”'`]/i;
+const EXECUTE_WORD = /\bexecut/i;
+
+const metaList = (meta: Meta, key: string): string[] => (Array.isArray(meta[key]) ? (meta[key] as string[]) : []);
+const unique = (values: string[]) => [...new Set(values)];
 
 export class PromptLibrary {
   readonly entries: PromptEntry[];
-  private byId: Map<string, PromptEntry>;
+  private readonly byId: Map<string, PromptEntry>;
+  private readonly byName: Map<string, PromptEntry>;
+  private readonly implemented: ReadonlySet<string>;
+  private readonly providerStatus: (name: string) => ProviderStatus;
 
-  constructor(readonly dir: string) {
+  constructor(
+    readonly dir: string,
+    capabilities: PromptCapabilities = {},
+  ) {
+    const implemented = capabilities.implementedTools ?? BFEXPLORER_TOOL_NAMES.filter((t) => t !== "execute_console_script");
+    this.implemented = new Set(implemented.map((t) => canonicalToolName(t) ?? t));
+    this.providerStatus = capabilities.providerStatus ?? ((name) => (isBfexplorerOnly(name) ? "unavailable" : "available"));
     this.entries = fs.existsSync(dir) ? this.load(dir) : [];
     this.byId = new Map(this.entries.map((e) => [e.id.toLowerCase(), e]));
+    this.byName = new Map([...promptNames(this.entries)].map(([name, e]) => [name.toLowerCase(), e]));
   }
 
   private load(dir: string): PromptEntry[] {
     const entries: PromptEntry[] = [];
     const walk = (current: string) => {
       for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+        if (entry.name.startsWith(".")) continue;
         const full = path.join(current, entry.name);
         if (entry.isDirectory()) walk(full);
-        else if (entry.name.endsWith(".md") && current !== dir) entries.push(this.parse(full, dir));
+        else if (entry.isFile() && entry.name.endsWith(".md") && current !== dir) {
+          const id = path.relative(dir, full).replace(/\\/g, "/").replace(/\.md$/, "");
+          if (!isExcludedPrompt(id)) entries.push(this.parse(id, fs.readFileSync(full, "utf8")));
+        }
       }
     };
     walk(dir);
     return entries.sort((a, b) => a.id.localeCompare(b.id));
   }
 
-  private parse(file: string, dir: string): PromptEntry {
-    const { meta, body } = parseFrontmatter(fs.readFileSync(file, "utf8"));
-    const id = path.relative(dir, file).replace(/\\/g, "/").replace(/\.md$/, "");
-    const declared = Array.isArray(meta.data_contexts) ? meta.data_contexts : [];
-    const referenced = [...body.matchAll(KNOWN_CONTEXT)].map((m) => m[1]);
-    const dataContexts = [...new Set([...declared, ...referenced])].filter(
-      (name) => declared.includes(name) || name in BFEXPLORER_ONLY_CONTEXTS || /^(MarketSelections|WeightOfMoney|BetfairSp|HorsesBase)/.test(name),
-    );
+  /** Analyse one prompt file (id is its path below the library dir, without .md). */
+  private parse(id: string, source: string): PromptEntry {
+    const { meta, body } = parseFrontmatter(source);
+
+    const toolSpellings: Record<string, string> = {};
+    const stored: string[] = [];
+    let strategyExecution = false;
+    for (const line of body.split(/\r?\n/)) {
+      let storesContext = false;
+      for (const [token] of line.matchAll(IDENTIFIER)) {
+        const tool = canonicalToolName(token);
+        if (!tool) continue;
+        toolSpellings[token] ??= tool;
+        storesContext ||= AI_CONTEXT_TOOLS.has(tool);
+      }
+      if (storesContext) {
+        for (const [, name] of line.matchAll(QUOTED_NAME)) if (!canonicalToolName(name) && !providerName(name)) stored.push(name);
+      }
+      strategyExecution ||= EXECUTE_WORD.test(line) && BET_STRATEGY_NAME.test(line);
+    }
+    const declaredTools = metaList(meta, "mcp_tools").map(canonicalToolName).filter((t): t is string => !!t);
+    const tools = unique([...declaredTools, ...Object.values(toolSpellings)]);
+
+    const declared = metaList(meta, "data_contexts").map((name) => KNOWN_CONTEXTS.get(name.toLowerCase()) ?? name);
+    const referenced = [...body.matchAll(IDENTIFIER)].map(([token]) => providerName(token)).filter((n): n is string => !!n);
+    const dataContexts = unique([...declared, ...referenced]);
+    const storedDataContexts = unique([...dataContexts.filter((n) => AI_CONTEXT_NAME.test(n) && !providerName(n)), ...stored]);
+
+    const missingDataContexts: string[] = [];
+    const partialDataContexts: string[] = [];
+    for (const name of dataContexts) {
+      const status = this.providerStatus(name);
+      if (status === "partial") partialDataContexts.push(name);
+      else if (status === "unavailable" || (status === "unknown" && !storedDataContexts.includes(name))) missingDataContexts.push(name);
+    }
+    const missingTools = tools.filter((t) => !this.implemented.has(t));
+
     const heading = /^#\s+(.+)$/m.exec(body)?.[1]?.trim();
+    const basename = path.posix.basename(id);
     return {
       id,
       category: id.split("/")[0],
-      title: (typeof meta.title === "string" && meta.title) || heading || path.basename(id),
+      title: (typeof meta.title === "string" && meta.title) || heading || basename,
       type: typeof meta.type === "string" ? meta.type : undefined,
-      tags: Array.isArray(meta.tags) ? meta.tags : [],
-      description: firstParagraph(body) || heading || path.basename(id),
+      tags: metaList(meta, "tags"),
+      description: firstParagraph(body) || heading || basename,
+      tools,
+      toolSpellings,
       dataContexts,
-      missingDataContexts: dataContexts.filter((name) => name in BFEXPLORER_ONLY_CONTEXTS),
-      executesBets: BET_TOOLS.test(body),
+      storedDataContexts,
+      missingTools,
+      missingDataContexts,
+      partialDataContexts,
+      compatibility: missingTools.length || missingDataContexts.length || partialDataContexts.length ? "partial" : "full",
+      executesBets: tools.some((t) => EXECUTE_TOOLS.has(t)) || strategyExecution,
       body: body.trim(),
     };
   }
 
+  /** A prompt by id ("HorseRacing/X"), basename ("X") or MCP prompt name; case-insensitive. */
   get(id: string): PromptEntry | undefined {
-    const key = id.trim().replace(/\.md$/, "").toLowerCase();
-    return this.byId.get(key) ?? this.entries.find((e) => e.id.toLowerCase().endsWith(`/${key}`));
+    const key = id
+      .trim()
+      .replace(/\\/g, "/")
+      .replace(/^\/+/, "")
+      .replace(/^prompts\//i, "")
+      .replace(/\.md$/i, "")
+      .toLowerCase();
+    if (!key) return undefined;
+    return this.byId.get(key) ?? this.byName.get(key) ?? this.entries.find((e) => e.id.toLowerCase().endsWith(`/${key}`));
   }
 
-  search(options: { query?: string; category?: string; onlyFullySupported?: boolean; limit?: number }) {
+  search(options: { query?: string; category?: string; onlyFullySupported?: boolean; executesBets?: boolean; limit?: number }) {
     const terms = (options.query ?? "").toLowerCase().split(/\s+/).filter(Boolean);
     const scored = this.entries
       .filter((e) => !options.category || e.category.toLowerCase() === options.category.toLowerCase())
-      .filter((e) => !options.onlyFullySupported || e.missingDataContexts.length === 0)
+      .filter((e) => !options.onlyFullySupported || e.compatibility === "full")
+      .filter((e) => options.executesBets === undefined || e.executesBets === options.executesBets)
       .map((e) => {
-        const haystack = `${e.id} ${e.title} ${e.tags.join(" ")} ${e.dataContexts.join(" ")} ${e.description}`.toLowerCase();
+        const haystack = `${e.id} ${e.title} ${e.tags.join(" ")} ${e.dataContexts.join(" ")} ${e.tools.join(" ")} ${e.description}`.toLowerCase();
         const score = terms.reduce((total, t) => total + (haystack.includes(t) ? (e.title.toLowerCase().includes(t) ? 2 : 1) : 0), 0);
         return { e, score };
       })
@@ -118,7 +412,7 @@ export class PromptLibrary {
       .sort((a, b) => b.score - a.score || a.e.id.localeCompare(b.e.id));
     return {
       total: scored.length,
-      prompts: scored.slice(0, options.limit ?? 25).map(({ e }) => summary(e)),
+      prompts: scored.slice(0, Math.max(1, options.limit ?? 25)).map(({ e }) => summary(e)),
     };
   }
 }
@@ -130,29 +424,88 @@ export function summary(e: PromptEntry) {
     category: e.category,
     type: e.type,
     description: e.description,
+    tools: e.tools,
     dataContexts: e.dataContexts,
-    compatibility: e.missingDataContexts.length ? "partial" : "full",
-    ...(e.missingDataContexts.length ? { missingDataContexts: e.missingDataContexts } : {}),
+    compatibility: e.compatibility,
+    missingTools: e.missingTools,
+    missingDataContexts: e.missingDataContexts,
+    partialDataContexts: e.partialDataContexts,
     executesBets: e.executesBets,
   };
 }
 
-/** Text handed to the model when a library prompt is used through this connector. */
-export function renderPrompt(e: PromptEntry, mode: "paper" | "live", marketId?: string): string {
+/** Short unique MCP prompt names: the basename, or "<category>-<basename>" when basenames collide. */
+export function promptNames(entries: readonly PromptEntry[]): Map<string, PromptEntry> {
+  const basename = (e: PromptEntry) => path.posix.basename(e.id);
+  const counts = new Map<string, number>();
+  for (const e of entries) counts.set(basename(e).toLowerCase(), (counts.get(basename(e).toLowerCase()) ?? 0) + 1);
+  const names = new Map<string, PromptEntry>();
+  const taken = new Set<string>();
+  for (const e of entries) {
+    const base = (counts.get(basename(e).toLowerCase()) ?? 0) > 1 ? `${e.category}-${basename(e)}` : basename(e);
+    let name = base;
+    for (let n = 2; taken.has(name.toLowerCase()); n++) name = `${base}-${n}`;
+    taken.add(name.toLowerCase());
+    names.set(name, e);
+  }
+  return names;
+}
+
+// ---------------------------------------------------------------- rendering
+
+export interface RenderOptions {
+  mode: "paper" | "live";
+  /** Market to work on; validated, blank means none. */
+  marketId?: string;
+  /** How the server names its tools (TOOL_NAMES); default "snake". */
+  toolNaming?: ToolNaming;
+}
+
+/** Text handed to the model when a library prompt is used through this connector: notes, then the prompt body. */
+export function renderPrompt(e: PromptEntry, options: RenderOptions): string {
+  const naming = options.toolNaming ?? "snake";
+  const t = (snake: string) => actualToolName(snake, naming);
+  const marketId = options.marketId?.trim() ? assertMarketId(options.marketId) : undefined;
   const notes = [
-    `You are running the BetfairAiTrading prompt "${e.title}" through the Betfair AI Trading connector (${mode === "paper" ? "PAPER trading: bets are simulated against the live order book" : "LIVE trading: bets use real money"}).`,
+    `You are running the BetfairAiTrading prompt "${e.title}" through the Betfair AI Trading connector. ${
+      options.mode === "paper"
+        ? "PAPER trading: bets are simulated against the live order book; no real money is used."
+        : "LIVE trading: bets placed by this prompt use real money on the user's Betfair account."
+    }`,
     marketId
-      ? `Work on market ${marketId}: call OpenMarket with this marketId first so it becomes the active market.`
-      : "If GetActiveMarket reports no active market, use FindMarkets and OpenMarket to choose one first (ask the user if the choice is unclear).",
-    "Tool results are JSON rather than TOON; field names follow BFExplorer's conventions.",
+      ? `Work on market ${marketId}: call ${t("open_market")} with marketId ${marketId} first, and pass this marketId explicitly to every tool (${t("get_active_market")} accepts marketId too). Never switch markets.`
+      : `If ${t("get_active_market")} reports no active market, use ${t("find_markets")} and ${t("open_market")} to choose one (ask the user if unclear). Record the marketId and pass it explicitly afterwards.`,
+    `Market tools (${t("get_active_market")}, ${t("get_market")}, ${t("get_monitored_markets")}) return TOON text like BFExplorer; data contexts return JSON {market, selectionsData:[{selectionId, name, data:{...}}], data}. Selection ids are plain strings such as "98427997".`,
   ];
+
+  const mapping = Object.entries(e.toolSpellings)
+    .filter(([spelling, snake]) => !e.missingTools.includes(snake) && !isRegisteredSpelling(spelling, snake, naming))
+    .map(([spelling, snake]) => `${spelling} -> ${t(snake)}`);
+  if (mapping.length) notes.push(`Tool names in this prompt and the tools to call on this server: ${mapping.join(", ")}.`);
+  if (e.executesBets && !e.tools.some((tool) => EXECUTE_TOOLS.has(tool))) {
+    notes.push(`To execute a strategy the prompt names (such as "Bet 10 Euro"), call ${t("execute_strategy_settings")} with strategyName, marketId and selectionId.`);
+  }
+
+  if (e.missingTools.length) {
+    const spelled = e.missingTools.map((snake) => Object.keys(e.toolSpellings).find((s) => e.toolSpellings[s] === snake) ?? snake);
+    notes.push(`These BFExplorer tools are not available in this connector: ${spelled.join(", ")}. Skip the steps that need them, say so, and never invent their results.`);
+  }
   if (e.missingDataContexts.length) {
+    const described = e.missingDataContexts.map((name) => {
+      const source = Object.entries(BFEXPLORER_ONLY_CONTEXTS).find(([n]) => n.toLowerCase() === name.toLowerCase())?.[1].source;
+      return source ? `${name} (${source})` : name;
+    });
     notes.push(
-      `These data contexts are BFExplorer-only and will come back as unavailable: ${e.missingDataContexts.join(", ")}. Say so, and base the analysis on the data that is available instead of inventing values.`,
+      `These data contexts are not available in this connector and will come back as unavailable: ${described.join(", ")}. Continue the analysis without them: say they are missing and never invent or estimate their values.`,
     );
   }
-  if (e.executesBets && mode === "live") {
-    notes.push("This prompt places real-money bets. Confirm with the user before the first execution unless they have explicitly asked for autonomous execution.");
+  if (e.partialDataContexts.length) {
+    notes.push(
+      `These data contexts are only partly reproduced here: ${e.partialDataContexts.join(", ")}. Use the fields that are present and treat absent fields as missing; never invent values.`,
+    );
+  }
+  if (e.executesBets && options.mode === "live") {
+    notes.push("This prompt places real-money bets. Confirm with the user before the first execution unless they explicitly asked for autonomous execution.");
   }
   return `${notes.map((n) => `> ${n}`).join("\n")}\n\n${e.body}`;
 }
