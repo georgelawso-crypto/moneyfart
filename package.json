@@ -1,6 +1,6 @@
 {
   "name": "betfair-ai-trading-connector",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "MCP connector that brings the BetfairAiTrading toolkit (BFExplorer-compatible tools, data contexts, strategies and prompt library) to Claude, backed directly by the Betfair Exchange API.",
   "type": "module",
