@@ -8,7 +8,9 @@ import type { Connector } from "./connector.js";
 import { createServer, type SessionContext } from "./server.js";
 
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
-const SESSION_IDLE_MS = 60 * 60 * 1000;
+/** Sessions without a request for this long are closed. */
+export const SESSION_IDLE_MS = 30 * 60 * 1000;
+const DEFAULT_MAX_SESSIONS = 100;
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
 const PROXY_HEADERS = ["forwarded", "x-forwarded-for", "x-forwarded-host", "x-real-ip", "via"];
 
@@ -87,25 +89,40 @@ interface Session {
   lastSeen: number;
 }
 
+export interface HttpOptions {
+  /** Concurrent MCP sessions kept (default MCP_MAX_SESSIONS, else 100); a new one closes the least recently used. */
+  maxSessions?: number;
+}
+
+/** MCP_MAX_SESSIONS: concurrent MCP sessions (each holds every tool and prompt definition, about 1 MB). */
+export function maxSessionsFromEnv(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.MCP_MAX_SESSIONS?.trim();
+  if (!raw) return DEFAULT_MAX_SESSIONS;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 1) throw new Error(`MCP_MAX_SESSIONS must be a whole number of at least 1, got "${raw}"`);
+  return value;
+}
+
 /**
  * Streamable HTTP endpoint with one MCP session per client (each conversation gets its own
  * active market). Auth: `Authorization: Bearer <token>` or the token as a path segment
  * (`/mcp/<token>`, for clients such as claude.ai custom connectors that only take a URL).
  */
-export function createHttpServer(connector: Connector): http.Server {
+export function createHttpServer(connector: Connector, options: HttpOptions = {}): http.Server {
   const { host, authToken, allowedOrigins, bfexplorerCompat } = connector.config.http;
   const loopbackOnly = isLoopback(host);
+  const maxSessions = options.maxSessions ?? maxSessionsFromEnv();
   const sessions = new Map<string, Session>();
+
+  const close = (id: string, s: Session) => {
+    sessions.delete(id);
+    void s.transport.close();
+    void s.server.close();
+  };
 
   const sweep = setInterval(() => {
     const cutoff = Date.now() - SESSION_IDLE_MS;
-    for (const [id, s] of sessions) {
-      if (s.lastSeen < cutoff) {
-        sessions.delete(id);
-        void s.transport.close();
-        void s.server.close();
-      }
-    }
+    for (const [id, s] of sessions) if (s.lastSeen < cutoff) close(id, s);
   }, 60_000);
   sweep.unref();
 
@@ -224,6 +241,11 @@ export function createHttpServer(connector: Connector): http.Server {
     const transport: StreamableHTTPServerTransport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => crypto.randomUUID(),
       onsessioninitialized: (id) => {
+        // Bounded memory: clients that re-initialize without DELETE would otherwise pile up sessions.
+        while (sessions.size >= maxSessions) {
+          const [oldest] = [...sessions].reduce((a, b) => (b[1].lastSeen < a[1].lastSeen ? b : a));
+          close(oldest, sessions.get(oldest)!);
+        }
         sessions.set(id, { transport, server, context, lastSeen: Date.now() });
       },
       onsessionclosed: (id) => {

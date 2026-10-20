@@ -1,12 +1,13 @@
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult, ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
 import { z, type ZodRawShape } from "zod";
-import type { Connector } from "./connector.js";
+import { readOnlyBotsMessage, type Connector } from "./connector.js";
+import { normaliseNames } from "./contexts/service.js";
 import { selectionPositions } from "./exchange/math.js";
 import type { SettledBetView } from "./exchange/types.js";
 import { assertMarketId, compact, formatSelectionId, parseSelectionId, round, toToon, utcSeconds, type SelectionRef } from "./format.js";
 import { promptNames, renderPrompt, summary } from "./prompts.js";
-import type { State } from "./state.js";
+import { LOCK_RETRY_MS, type State } from "./state.js";
 
 const VERSION = "0.2.0";
 
@@ -69,10 +70,19 @@ const parametersArg = z
   .describe('Parameter overrides as an object or JSON string, e.g. {"OpenBetPosition.BetType":"Lay","CloseBetPosition.Profit":9} or {"Stake":5}');
 
 function contextNames(args: { dataContextNames?: string[] | string; dataContextName?: string }): string[] {
-  const raw = Array.isArray(args.dataContextNames) ? args.dataContextNames : (args.dataContextNames ?? "").split(",");
-  const names = [...raw, args.dataContextName ?? ""].map((n) => n.trim()).filter(Boolean);
+  // Some clients send the array as JSON text ('["BetfairSpData","WeightOfMoneyData"]'): normaliseNames parses it.
+  const names = normaliseNames([args.dataContextNames ?? [], args.dataContextName ?? ""]);
   if (!names.length) throw new Error("Provide dataContextNames (or dataContextName).");
-  return [...new Set(names)];
+  return names;
+}
+
+/** Added to the result of every state-changing tool while this process cannot save. */
+function readOnlyWarning(state: State): string {
+  return (
+    `WARNING: this connector process is read-only (${state.readOnlyReason ?? "DATA_DIR is in use by another connector process"}). ` +
+    "Changes made here (paper bets, AI data contexts, strategy settings, the active market) are kept in memory only, and are saved " +
+    `only if this process takes DATA_DIR over when the other one exits (retried every ${LOCK_RETRY_MS / 1000} s). Bots run only in the process that owns DATA_DIR.`
+  );
 }
 
 function jsonObject(value: unknown, what: string): Record<string, unknown> {
@@ -364,8 +374,7 @@ export function createServer(connector: Connector, session: SessionContext = sta
           throw new Error(`jsonData must be valid JSON: ${(error as Error).message}`);
         }
       }
-      if (JSON.stringify(data).length > 1_000_000) throw new Error("jsonData is larger than 1 MB.");
-      state.setDataContext(id, dataContextName, data);
+      state.setDataContext(id, dataContextName, data); // enforces the 1 MB and per-market/total limits
       return { json: { status: true, marketId: id, dataContextName } };
     },
   });
@@ -375,11 +384,15 @@ export function createServer(connector: Connector, session: SessionContext = sta
     legacy: "GetAIAgentDataContextFeedback",
     title: "AI analysis feedback",
     description:
-      "Every stored AI-agent context with this name across markets (newest first), joined with the settled result (winners, BSP) and this connector's profit on the market, to evaluate a strategy's decisions.",
-    input: { dataContextName: z.string(), forLastResults: z.number().int().min(1).max(1000).optional().describe("Default 100") },
+      "Stored AI-agent contexts with this name for the last N settled markets (newest first), joined with the result (winners, BSP) and this connector's profit on the market, to evaluate a strategy's decisions. Markets that have not settled yet are left out unless includeOpen is true.",
+    input: {
+      dataContextName: z.string(),
+      forLastResults: z.number().int().min(1).max(1000).optional().describe("Number of settled markets (default 100)"),
+      includeOpen: z.boolean().optional().describe("Connector option: also return markets that have not settled yet; they then count toward forLastResults (default false, like BFExplorer)"),
+    },
     annotations: READ,
-    run: async ({ dataContextName, forLastResults }) => {
-      const entries = await contexts.feedback(dataContextName, forLastResults ?? 100);
+    run: async ({ dataContextName, forLastResults, includeOpen }) => {
+      const entries = await contexts.feedback(dataContextName, forLastResults ?? 100, { includeOpen });
       const profits = await settledProfitByMarket(entries.filter((e) => e.market.settled).map((e) => e.market.marketId));
       return {
         json: entries.map((e) => (profits.has(e.market.marketId) ? { ...e, profit: round(profits.get(e.market.marketId), 4) } : e)),
@@ -523,7 +536,7 @@ export function createServer(connector: Connector, session: SessionContext = sta
     annotations: BETTING,
     run: async ({ strategyName, marketId, selectionId }) => {
       const id = marketOf(marketId);
-      return { json: await strategies.execute(strategyName, id, [selectionOf(id, selectionId)]) };
+      return { json: await connector.executeStrategy(strategyName, id, [selectionOf(id, selectionId)]) };
     },
   });
 
@@ -535,7 +548,7 @@ export function createServer(connector: Connector, session: SessionContext = sta
     input: { strategyName: z.string(), marketId: optionalMarketId, selectionIds: z.array(selectionIdArg).min(1) },
     annotations: BETTING,
     run: async ({ strategyName, marketId, selectionIds }) => ({
-      json: await strategies.execute(strategyName, marketOf(marketId), selectionIds.map((s: string | number) => parseSelectionId(s))),
+      json: await connector.executeStrategy(strategyName, marketOf(marketId), selectionIds.map((s: string | number) => parseSelectionId(s))),
     }),
   });
 
@@ -548,7 +561,7 @@ export function createServer(connector: Connector, session: SessionContext = sta
     annotations: BETTING,
     run: async ({ strategyName, marketId, selectionId, parameters }) => {
       const id = marketOf(marketId);
-      return { json: await strategies.execute(strategyName, id, [selectionOf(id, selectionId)], jsonObject(parameters, "parameters")) };
+      return { json: await connector.executeStrategy(strategyName, id, [selectionOf(id, selectionId)], jsonObject(parameters, "parameters")) };
     },
   });
 
@@ -569,7 +582,11 @@ export function createServer(connector: Connector, session: SessionContext = sta
     description: "Connector tool: stop a running strategy bot, optionally closing (greening up) the position it manages.",
     input: { botId: z.string(), closePosition: z.boolean().optional() },
     annotations: BETTING,
-    run: async ({ botId, closePosition }) => ({ json: await bots.stop(botId, { closePosition }) }),
+    run: async ({ botId, closePosition }) => {
+      // The bots listed here belong to the owning process: stopping or closing them here would act twice.
+      if (!state.ownsDataDir()) throw new Error(readOnlyBotsMessage(state));
+      return { json: await bots.stop(botId, { closePosition }) };
+    },
   });
 
   // ---------------------------------------------------------------- bets and account
@@ -654,7 +671,13 @@ export function createServer(connector: Connector, session: SessionContext = sta
         return "Recorded monitored markets.";
       },
     },
-    StopAllBots: { description: "Stop every running strategy bot (positions stay open).", run: async () => `Stopped ${await bots.stopAll()} bot(s).` },
+    StopAllBots: {
+      description: "Stop every running strategy bot (positions stay open).",
+      run: async () => {
+        if (!state.ownsDataDir()) throw new Error(readOnlyBotsMessage(state));
+        return `Stopped ${await bots.stopAll()} bot(s).`;
+      },
+    },
     RemoveClosedMarkets: {
       description: "Remove closed markets from the monitored list.",
       run: async () => {
@@ -732,9 +755,11 @@ export function createServer(connector: Connector, session: SessionContext = sta
           activeMarketId: session.activeMarketId,
           monitoredMarkets: [...state.monitored.values()].filter((m) => !m.companionOf).length,
           runningBots: bots.list({ status: "running" }).length,
+          botsRunInThisProcess: !state.readOnly,
           recordingIntervalSeconds: config.recording.intervalSeconds,
           promptLibrary: { prompts: prompts.entries.length, fullySupported: prompts.entries.filter((e) => e.compatibility === "full").length },
-          persistence: config.dataDir ? (state.readOnly ? "file (read-only: DATA_DIR is used by another process)" : "file") : "memory",
+          persistence: config.dataDir ? (state.readOnly ? "file (read-only)" : "file") : "memory",
+          readOnly: state.readOnly ? readOnlyWarning(state) : undefined,
           displayTimeZone: config.output.displayTimeZone,
         },
       };
@@ -788,11 +813,15 @@ export function createServer(connector: Connector, session: SessionContext = sta
         toolName,
         { title: def.title, description: `${def.description} (Also known as ${other}.)`, inputSchema: def.input ?? {}, annotations: def.annotations },
         async (args: unknown) => {
+          let result: CallToolResult;
           try {
-            return render(await def.run(args ?? {}));
+            result = render(await def.run(args ?? {}));
           } catch (error) {
-            return { isError: true, content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }] };
+            result = { isError: true, content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }] };
           }
+          // A separate line, so the tool's own text stays parseable.
+          if (state.readOnly && def.annotations.readOnlyHint === false) result.content.push({ type: "text", text: readOnlyWarning(state) });
+          return result;
         },
       );
     }

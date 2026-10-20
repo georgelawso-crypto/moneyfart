@@ -263,8 +263,11 @@ describe("state", () => {
     const second = State.forDataDir(dir);
     assert.equal(second.readOnly, true, "a second process must not overwrite the ledger");
     assert.deepEqual(second.getDataContext("1.1", "Analysis")!.data, { pick: 1 });
-    // A lock left by a dead process is taken over.
+    // A lock nobody has refreshed for over two minutes (its owner is gone) is taken over.
     fs.writeFileSync(path.join(dir, "state.lock"), "999999");
+    const stale = new Date(Date.now() - 3 * 60_000);
+    fs.utimesSync(path.join(dir, "state.lock"), stale, stale);
+    second.release();
     const third = State.forDataDir(dir);
     assert.equal(third.readOnly, false);
     third.release();

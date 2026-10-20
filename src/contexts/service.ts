@@ -29,19 +29,46 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-/** Split, trim and de-duplicate (case-insensitively) the requested context names, keeping the first spelling. */
-function normaliseNames(names: string[] | string): string[] {
+/** A JSON array sent as text (clients that serialise array arguments), or undefined when the text is not one. */
+function jsonArray(text: string): unknown[] | undefined {
+  if (!text.startsWith("[") || !text.endsWith("]")) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(text);
+    return Array.isArray(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Split, trim and de-duplicate (case-insensitively) the requested context names, keeping the first
+ * spelling. Accepts arrays, comma-separated text and JSON arrays sent as text; a bracketed list
+ * that is not valid JSON (e.g. "[A, 'B']") loses its brackets and the quotes around each name.
+ */
+export function normaliseNames(names: unknown): string[] {
   const seen = new Set<string>();
   const result: string[] = [];
-  for (const raw of ([] as unknown[]).concat(names)) {
-    if (typeof raw !== "string") continue;
-    for (const part of raw.split(",")) {
-      const name = part.trim();
+  const add = (raw: unknown) => {
+    if (Array.isArray(raw)) {
+      for (const item of raw) add(item);
+      return;
+    }
+    if (typeof raw !== "string") return;
+    const text = raw.trim();
+    const parsed = jsonArray(text);
+    if (parsed) {
+      add(parsed);
+      return;
+    }
+    const list = text.startsWith("[") && text.endsWith("]") ? text.slice(1, -1) : text;
+    for (const part of list.split(",")) {
+      const name = part.trim().replace(/^["'`]+|["'`]+$/g, "").trim();
       if (!name || seen.has(name.toLowerCase())) continue;
       seen.add(name.toLowerCase());
       result.push(name);
     }
-  }
+  };
+  add(names);
   return result;
 }
 
@@ -299,7 +326,12 @@ export class DataContextService implements DataContextApi {
     return list;
   }
 
-  async feedback(dataContextName: string, forLastResults: number): Promise<FeedbackEntry[]> {
+  /**
+   * Stored contexts with this name for the last N settled (closed) markets, newest first, joined
+   * with their results, as BFExplorer counts forLastResults. With includeOpen, markets that have
+   * not settled are returned (and counted) too.
+   */
+  async feedback(dataContextName: string, forLastResults: number, options: { includeOpen?: boolean } = {}): Promise<FeedbackEntry[]> {
     const wanted = String(dataContextName ?? "").trim().toLowerCase();
     if (!wanted) throw new Error("dataContextName is required.");
     const requested = Number.isFinite(forLastResults) ? Math.floor(forLastResults) : DEFAULT_FEEDBACK;
@@ -310,9 +342,27 @@ export class DataContextService implements DataContextApi {
     }
     const storedAt = (s: StoredDataContext) => Date.parse(s.updatedAt) || 0;
     found.sort((a, b) => storedAt(b.stored) - storedAt(a.stored));
-    const latest = found.slice(0, limit);
-    await this.refreshResults([...new Set(latest.map((f) => f.marketId))]);
+    if (options.includeOpen) {
+      const latest = found.slice(0, limit);
+      await this.refreshResults([...new Set(latest.map((f) => f.marketId))]);
+      return latest.map(({ marketId, stored }) => this.feedbackEntry(marketId, stored));
+    }
+    // Look results up a batch at a time, newest first, until enough settled markets are found.
+    const latest: typeof found = [];
+    for (let i = 0; i < found.length && latest.length < limit; i += RESULT_BATCH) {
+      const batch = found.slice(i, i + RESULT_BATCH);
+      const now = Date.now();
+      await this.refreshResults([...new Set(batch.filter((f) => !this.notStarted(f.marketId, now)).map((f) => f.marketId))]);
+      for (const f of batch) if (latest.length < limit && this.state.archive.has(f.marketId)) latest.push(f);
+    }
     return latest.map(({ marketId, stored }) => this.feedbackEntry(marketId, stored));
+  }
+
+  /** A market whose known start is still ahead cannot have settled: no result lookup needed. */
+  private notStarted(marketId: string, now: number): boolean {
+    if (this.state.archive.has(marketId)) return false;
+    const start = Date.parse(this.markets.cachedCatalogue(marketId)?.marketStartTime ?? "");
+    return Number.isFinite(start) && start > now;
   }
 
   private needsResult(marketId: string, now: number): boolean {

@@ -799,9 +799,13 @@ describe("providers and feedback", () => {
     fake.settle([101], WIN_MARKET, { bsp: { 101: 3.4, 102: 7.2, 103: 5 } });
     await markets.getBook(WIN_MARKET, { sp: true });
 
+    // Like BFExplorer, only settled markets: the open PLACE market and the unknown id are left out.
     const entries = await contexts.feedback("EVAnalysis", 100);
-    assert.deepEqual(entries.map((e) => e.market.marketId), [PLACE_MARKET, WIN_MARKET, "1.300000001"]);
-    const [place, win, unknown] = entries;
+    assert.deepEqual(entries.map((e) => e.market.marketId), [WIN_MARKET]);
+    const withOpen = await contexts.feedback("EVAnalysis", 100, { includeOpen: true });
+    assert.deepEqual(withOpen.map((e) => e.market.marketId), [PLACE_MARKET, WIN_MARKET, "1.300000001"]);
+    const [place, win, unknown] = withOpen;
+    assert.deepEqual(entries[0], win);
     assert.deepEqual(Object.keys(win), ["market", "data", "storedAt", "result"]);
     assert.deepEqual(Object.keys(win.market), ["marketId", "startTime", "eventType", "eventName", "marketName", "status", "settled"]);
     assert.deepEqual({ ...win.market, startTime: undefined }, {
@@ -828,13 +832,39 @@ describe("providers and feedback", () => {
     assert.deepEqual(unknown.market, { marketId: "1.300000001", marketName: "1.300000001", settled: false });
 
     assert.equal((await contexts.feedback("evanalysis", 1)).length, 1);
+    assert.equal((await contexts.feedback("evanalysis", 1, { includeOpen: true }))[0].market.marketId, PLACE_MARKET);
     assert.deepEqual(await contexts.feedback("Missing", 10), []);
     await assert.rejects(contexts.feedback(" ", 10), /dataContextName is required/);
   });
 
+  test("forLastResults counts settled markets: newer unsettled analyses do not push results out", async () => {
+    const fake = new FakeBetfair();
+    const { contexts, state, markets } = setup(fake);
+    await markets.getCatalogue(WIN_MARKET);
+    await markets.getCatalogue(PLACE_MARKET);
+    const older = ["1.600000001", "1.600000002", "1.600000003"];
+    for (const [i, id] of older.entries()) {
+      state.archiveMarket(settled(id, `Race ${i}`, "2026-10-01T13:00:00.000Z", [runner(1, "Winner", { bsp: 2 }), runner(2, "Loser", { bsp: 4 })]));
+      state.setDataContext(id, "R11_DecisionData", { pick: i });
+      state.dataContexts.get(id)!.get("R11_DecisionData")!.updatedAt = `2026-10-0${i + 1}T10:00:00.000Z`;
+    }
+    // Newer analyses of races that have not been run yet (open markets, and one Betfair does not know).
+    for (const id of [WIN_MARKET, PLACE_MARKET, "1.600000099"]) state.setDataContext(id, "R11_DecisionData", { pick: "pending" });
+
+    const entries = await contexts.feedback("R11_DecisionData", 3);
+    assert.deepEqual(entries.map((e) => e.market.marketId), [...older].reverse());
+    assert.ok(entries.every((e) => e.market.settled && e.result!.runners.some((r) => r.isWinner)));
+    assert.equal(fake.calls.filter((c) => c.method === "listMarketBook" && c.args.marketIds.includes(WIN_MARKET)).length, 0, "markets that have not started are not looked up");
+    assert.equal((await contexts.feedback("R11_DecisionData", 3, { includeOpen: true })).filter((e) => e.market.settled).length, 0);
+  });
+
   test("feedback returns at most 1000 entries", async () => {
     const { contexts, state } = setup();
-    for (let i = 0; i < 1005; i++) state.setDataContext(`1.4${String(i).padStart(8, "0")}`, "Bulk", { i });
+    for (let i = 0; i < 1005; i++) {
+      const id = `1.4${String(i).padStart(8, "0")}`;
+      state.archiveMarket(settled(id, `Race ${i}`, "2026-10-01T13:00:00.000Z", [runner(1, "Winner", { bsp: 2 })]));
+      state.setDataContext(id, "Bulk", { i });
+    }
     assert.equal((await contexts.feedback("Bulk", 5000)).length, 1000);
     assert.equal((await contexts.feedback("Bulk", Number.NaN)).length, 100);
   });
@@ -906,8 +936,7 @@ describe("review: feedback results", () => {
       { selectionId: "102", name: "Slow Horse", status: "Winner", isWinner: true, bsp: 7.2 },
       { selectionId: "103", name: "Mid Horse", status: "Loser", isWinner: false, bsp: 5 },
     ]);
-    const place = entries.find((e) => e.market.marketId === PLACE_MARKET)!;
-    assert.equal(place.market.settled, false, "the still-open PLACE market is not settled");
+    assert.equal(entries.find((e) => e.market.marketId === PLACE_MARKET), undefined, "the still-open PLACE market is not settled");
     assert.equal(state.archive.get(WIN_MARKET)?.marketType, "WIN", "the result is archived for race history");
     assert.equal(recorder.get(WIN_MARKET), undefined, "result lookups do not evict live recordings");
 
@@ -947,7 +976,8 @@ describe("review: feedback results", () => {
     }
     const { contexts, state } = setup(new BooksFail());
     state.setDataContext(WIN_MARKET, "EVAnalysis", { pick: "101" });
-    const [entry] = await contexts.feedback("EVAnalysis", 10);
+    assert.deepEqual(await contexts.feedback("EVAnalysis", 10), [], "no result is known, so nothing has settled");
+    const [entry] = await contexts.feedback("EVAnalysis", 10, { includeOpen: true });
     assert.equal(entry.market.settled, false);
   });
 
@@ -978,8 +1008,9 @@ describe("review: feedback results", () => {
     state.setDataContext(WIN_MARKET, "EVAnalysis", { pick: "101" });
     fake.settle([101], WIN_MARKET);
     const entries = await contexts.feedback("EVAnalysis", 10);
-    assert.equal(entries.length, 2);
-    assert.equal(entries.find((e) => e.market.marketId === WIN_MARKET)!.market.settled, true);
+    assert.deepEqual(entries.map((e) => e.market.marketId), [WIN_MARKET], "the unknown id has no result, so it does not count");
+    assert.equal(entries[0].market.settled, true);
+    assert.equal((await contexts.feedback("EVAnalysis", 10, { includeOpen: true })).length, 2);
     for (const call of fake.calls.filter((c) => c.method === "listMarketBook")) assert.ok(!call.args.marketIds.includes("not-a-market"));
   });
 });
