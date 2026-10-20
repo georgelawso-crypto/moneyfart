@@ -449,6 +449,15 @@ function parseValue(spec: ParameterSpec, raw: unknown): ParamValue {
 }
 
 /**
+ * Keys some bundled prompts put into their parameter JSON purely for reporting
+ * (BetfairMarketAnalysisCandleStickDataR4_Favourite returns "PressureInfo": {BLR, BPI}).
+ * They are ignored; every other unknown key still rejects the execution.
+ */
+const INFORMATIONAL_KEYS = new Set(["pressureinfo"]);
+
+const isInformational = (key: string) => INFORMATIONAL_KEYS.has(key.split(".")[0].toLowerCase());
+
+/**
  * Validate parameters against a template: flatten nested objects into dotted keys, match names
  * case-insensitively (aliases, plain names on the open/close template, a stripped
  * OpenBetPosition. prefix elsewhere) and parse values strictly. Returns canonical names only.
@@ -464,6 +473,7 @@ export function parseParameters(template: TemplateSpec, input: Record<string, un
   const unknown: string[] = [];
   const errors: string[] = [];
   for (const [key, raw] of flattenParameters(input ?? {})) {
+    if (isInformational(key)) continue;
     const spec = findSpec(lookup, key);
     if (spec === null) {
       errors.push(`Parameter "${key}" is ambiguous; use the dotted ${OPEN}/${CLOSE} name.`);

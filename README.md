@@ -60,7 +60,7 @@ The 24 BFExplorer tools are listed below; `execute_console_script`, which runs F
 | `set_ai_agent_data_context_for_market` (SetAIAgentDataContextForBetfairMarket) | Store the agent's JSON analysis for a market |
 | `get_ai_agent_data_context_feedback` | Stored analyses across settled markets, joined with winners, BSP and your profit |
 | `get_all_strategy_settings`, `get_strategy_setting`, `get_all_strategy_templates`, `get_strategy_template`, `create_strategy_settings` | Strategy settings and templates |
-| `execute_strategy_settings` / `_on_selections` / `_with_parameters` (ExecuteBfexplorerStrategySettings…) | Run a strategy. Results start with `{"status":true\|false, …}` as in BFExplorer, followed by details. |
+| `execute_strategy_settings` / `_on_selections` / `_with_parameters` (ExecuteBfexplorerStrategySettings…) | Run a strategy. Results start with `{"status":true\|false, …}` as in BFExplorer, followed by details. `status` is false whenever nothing was placed because a condition was not met (odds range, no price, limits, minimum bet), so a prompt cannot report a bet that never happened. Genuine no-ops, such as closing an already flat position, return true with a message. |
 | `get_all_bet_results` | Settled bets grouped like BFExplorer (`betResults` → `selectionsBets` → bets), plus totals, commission and per-strategy ROI |
 | `get_my_favourite_bet_events` / `…_markets` | BFExplorer's default bet-event groups (GB/IE racing, football, in-play tennis, …) |
 | `get_application_commands` / `execute_application_command` | RecordNow, StopAllBots, RemoveClosedMarkets, ClearActiveMarket, RetryBetfairLogin |
@@ -123,11 +123,20 @@ Built-in settings carry the names the prompts use:
 - **Trading:** Trade x profit, Trade 20% profit, Trade 5/3 ticks, Trade 2 Ticks Profit or 10 Ticks Loss, Trading Strategy, Back/Lay Trade.
 - **Trailing stops:** Trailing Stop Loss 3 Ticks, Back trailing stop loss trading.
 - **Position management:** Close Selection/Market Bet Position, Cancel Selection/Market Bets.
-- **Dutching:** Dutch to profit 10 Euro, Dutch for 10 Euro, Dutch 10 Euro stake.
+- **Dutching:** Dutch to profit 10 Euro (profit target), Dutch for 10 Euro and Dutch 10 Euro stake (total stake).
+- **Candlestick-prompt trades:** Back scalping strategy, Back hedge strategy, Conservative back strategy, Technical back strategy, Lay fade strategy, Lay resistance trading, Conservative lay strategy, Steam momentum trading, Drift momentum trading.
 
 Stakes are in your account currency.
 
-Parameters can be flat, dotted (`OpenBetPosition.Stake`) or nested objects. Unknown parameter names reject the execution before any bet is placed; BFExplorer silently ignores them.
+Parameters can be flat, dotted (`OpenBetPosition.Stake`) or nested objects. Unknown parameter names reject the execution before any bet is placed; BFExplorer silently ignores them. The one exception is `PressureInfo`, a reporting-only field one bundled prompt adds to its parameter JSON, which is ignored.
+
+How the trading templates behave:
+
+- **Targets win:** a profit, loss or close-time target takes precedence over `ClosePositionImmediately`.
+- **Close Selection Bet Position:** given targets, it starts a bot instead of closing at once.
+- **Bots don't over-hedge:** a bot counts resting closing bets from anyone (other bots, manual closes) before it hedges.
+- **Restart-safe:** each bet's `customerOrderRef` is saved before it is sent, and any unconfirmed bet is reconciled first after a restart, so nothing is placed twice.
+- **Fill or Kill:** if the cancel can't be confirmed, the result says the bet may still be resting.
 
 ## Paper trading
 
@@ -137,8 +146,10 @@ Paper mode aims to keep paper results honest, so a strategy shouldn't look profi
 - **Resting orders:** fill only on evidence (the book crossing them, or traded volume beyond the queue ahead of them), never from a stale last traded price.
 - **In-play and timing:** in-play orders wait out the bet delay. Pre-off LAPSE orders lapse at the off.
 - **Non-runners:** bets on the removed runner are voided, unmatched bets are cancelled, and earlier bets on other runners get the reduction factor.
-- **Account rules:** Betfair's minimum bet size and payout rule, a funds check and per-market commission all apply.
-- **Settlement:** uses real results. Markets that close while the connector isn't watching are settled on the next poll.
+- **Account rules:** Betfair's minimum bet size and payout rule and a funds check apply. Commission uses each market's base rate (`PAPER_COMMISSION_RATE` is the fallback).
+- **Settlement:** uses real results, including dead heats. Markets that close while the connector isn't watching are settled on the next poll.
+- **Out-of-order snapshots:** a market snapshot older than one already processed is ignored, so a stale book can't create a phantom fill.
+- **Undatable volume:** traded volume that can't be dated relative to the off or a non-runner removal is not credited to orders.
 
 ## Safety
 
@@ -156,7 +167,11 @@ Paper mode aims to keep paper results honest, so a strategy shouldn't look profi
   - unauthenticated requests carrying proxy headers are refused;
   - the `Host` header is checked on loopback binds;
   - each conversation gets its own MCP session and its own active market.
-- **Persistence:** `DATA_DIR` holds the paper ledger, AI contexts, custom settings, bots and settled results. It is locked to one process, written atomically, and saved on every exit path.
+- **Persistence:** `DATA_DIR` holds the paper ledger, AI contexts, custom settings, bots and settled results.
+  - **Lock:** one process owns `DATA_DIR`. Its lock has a heartbeat and is considered stale after 2 minutes, which also works for containers sharing a volume.
+  - **Second process:** it runs read-only and never runs bots. It takes over, merging its changes, when the owner exits.
+  - **Safe saves:** saves are fsynced and atomic and happen on every exit path. A corrupt or older-version state file is backed up, never overwritten.
+  - **Limits:** stored AI contexts are capped at 1 MB each, 50 names per market and 50 MB in total.
 
 ## Setup
 
@@ -201,7 +216,7 @@ Things to know about hosting:
 | `BETFAIR_KEEPALIVE_MINUTES` | 240 (10 on .it/.es) | Session keepAlive interval |
 | `TRADING_MODE` | `paper` | `live` places real-money bets |
 | `MAX_STAKE`, `MAX_LIABILITY` | 25, 250 | Per-bet limits on risk-adding bets |
-| `PAPER_STARTING_BALANCE`, `PAPER_COMMISSION_RATE`, `PAPER_CURRENCY` | 1000, 0.05, GBP | Paper account |
+| `PAPER_STARTING_BALANCE`, `PAPER_COMMISSION_RATE`, `PAPER_CURRENCY` | 1000, 0.05, GBP | Paper account (commission rate is the fallback when a market's base rate is unknown) |
 | `MIN_BET_SIZE`, `MIN_BET_PAYOUT` | per currency | Override Betfair's minimum bet rules |
 | `RECORD_INTERVAL_SECONDS`, `BOT_INTERVAL_SECONDS` | 30, 5 | Polling of monitored markets / markets with bots |
 | `MAX_MONITORED_MARKETS`, `MAX_RECORDED_MARKETS`, `MAX_TRADES_PER_SELECTION` | 20, 60, 5000 | Memory bounds |
@@ -211,6 +226,7 @@ Things to know about hosting:
 | `DATA_DIR` | | Persistence directory |
 | `MCP_AUTH_TOKEN`, `HOST`, `PORT` | , 127.0.0.1, 3000 | HTTP transport |
 | `MCP_ALLOWED_ORIGINS` | none | Comma-separated browser origins allowed to call the server |
+| `MCP_MAX_SESSIONS` | 100 | Concurrent HTTP MCP sessions (least recently used evicted; idle sessions expire after 30 minutes) |
 | `MCP_ALLOW_UNAUTHENTICATED_LOOPBACK` | off | Local paper-mode server without a token |
 | `BFEXPLORER_COMPAT` | off | Serve MCP at `/` on port 10043 |
 
@@ -221,13 +237,15 @@ Things to know about hosting:
 - **Bot reaction time:** bots act on polls (default 5 s), not on the streaming API, so very fast scalping is out of scope.
 - **Paper simplifications:**
   - each-way, BSP and line markets are refused in paper mode;
-  - reduction factors use a simple multiplicative rule.
+  - reduction factors use a simple multiplicative rule;
+  - dead heats on multi-place markets use the average share.
+- **One live process per `DATA_DIR`:** a read-only second process can still run an immediate Close Selection/Market at the same time as the owner's bots, so don't point two live connectors at the same account and `DATA_DIR`.
 - **Settled-result retention:** Betfair keeps runner results for 90 days and cleared orders for 90 days.
 
 ## Development
 
 ```bash
-npm test             # 335 tests: unit, module, MCP end-to-end and HTTP
+npm test             # 397 tests: unit, module, MCP end-to-end and HTTP
 npm run typecheck
 npm run dev          # from source
 npm run sync-prompts # refresh prompts/ from upstream

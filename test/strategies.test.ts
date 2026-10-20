@@ -246,6 +246,19 @@ describe("parameter normalisation", () => {
   const trade = findTemplate("Place Bet and Close Selection Bet Position")!;
   const placeBet = findTemplate("place bet")!;
 
+  test("the candlestick R4 prompt's informational PressureInfo is ignored, other unknown keys still reject", () => {
+    const params = parseParameters(trade, {
+      "CloseBetPosition.Profit": 4,
+      "CloseBetPosition.Loss": 25,
+      PressureInfo: { BLR: 0.62, BPI: "aligned" },
+      "OpenBetPosition.Stake": 6.44,
+    });
+    assert.equal(params["CloseBetPosition.Profit"], 4);
+    assert.equal(params["OpenBetPosition.Stake"], 6.44);
+    assert.ok(!Object.keys(params).some((k) => /pressure/i.test(k)));
+    assert.throws(() => parseParameters(trade, { PressureInfo: "x", "CloseBetPosition.Price": 3 }), /CloseBetPosition\.Price/);
+  });
+
   test("dotted, nested and plain names give the same parameters on the open/close template", () => {
     const dotted = parseParameters(trade, { "OpenBetPosition.BetType": "Lay", "OpenBetPosition.Stake": 5, "CloseBetPosition.Profit": 12 });
     const nested = parseParameters(trade, { OpenBetPosition: { BetType: "Lay", Stake: 5 }, CloseBetPosition: { Profit: 12 } });
