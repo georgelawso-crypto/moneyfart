@@ -168,7 +168,9 @@ describe("paper: resting orders", () => {
     const [bet] = await place([back(101, 3.15, 20)]);
     assert.equal(order(bet.betId!).meta!.queue, 40);
     fake.setOffers(101, [[3.0, 100]], [[3.05, 80], [3.1, 60], [3.15, 5]]); // others cancelled ahead of us
-    fake.trade(101, 3.15, 10);
+    assert.equal((await view(bet.betId!))!.sizeMatched, 0);
+    assert.equal(order(bet.betId!).meta!.queue, 5);
+    fake.trade(101, 3.15, 10); // the 5 ahead, then 5 of ours (3.15 still shows 5 of newer money behind us)
     assert.equal((await view(bet.betId!))!.sizeMatched, 5);
   });
 
@@ -772,5 +774,203 @@ describe("paper: persistence", () => {
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("paper: traded-volume evidence", () => {
+  test("volume that also shrinks the displayed level is not counted twice against the queue", async () => {
+    const { fake, place, view, order } = setup();
+    const [bet] = await place([back(101, 3.1, 20, "PERSIST")]); // rests behind 60 offered at 3.1
+    assert.equal(order(bet.betId!).meta!.queue, 60);
+    fake.trade(101, 3.1, 40); // layers take 40 of the 60 ahead: 20 are still shown, all of them ahead of us
+    fake.setOffers(101, [[3.0, 100]], [[3.05, 80], [3.1, 20], [3.15, 40]]);
+    assert.equal((await view(bet.betId!))!.sizeMatched, 0);
+    assert.equal(order(bet.betId!).meta!.queue, 20);
+    fake.trade(101, 3.1, 30); // the last 20 ahead, then 10 of ours
+    fake.setOffers(101, [[3.0, 100]], [[3.05, 80], [3.15, 40]]);
+    assert.equal((await view(bet.betId!))!.sizeMatched, 10);
+    assert.equal(order(bet.betId!).meta!.queue, 0);
+  });
+
+  test("volume first seen in a suspended book counts, and its empty ladder is not an empty queue", async () => {
+    const { fake, place, view, order } = setup();
+    const [bet] = await place([back(101, 3.1, 20, "PERSIST")]); // behind 60 at 3.1
+    const reopen = (lay: Array<[number, number]>) => {
+      fake.book().status = "OPEN";
+      fake.setOffers(101, [[3.0, 100]], lay);
+    };
+    const suspend = () => {
+      fake.book().status = "SUSPENDED"; // suspended books often show no offers
+      fake.setOffers(101, [], []);
+    };
+    fake.trade(101, 3.1, 40);
+    suspend();
+    assert.equal((await view(bet.betId!))!.sizeMatched, 0);
+    assert.equal(order(bet.betId!).meta!.queue, 20, "the 40 traded before the suspension cleared part of the queue");
+    reopen([[3.05, 80], [3.1, 20], [3.15, 40]]);
+    assert.equal((await view(bet.betId!))!.sizeMatched, 0);
+    fake.trade(101, 3.1, 30);
+    suspend();
+    assert.equal((await view(bet.betId!))!.sizeMatched, 10);
+    reopen([[3.05, 80], [3.15, 40]]);
+    assert.equal((await view(bet.betId!))!.sizeMatched, 10, "the same volume does not fill twice");
+  });
+
+  test("in-play volume first seen in a suspended or closed book fills a resting order before it settles", async () => {
+    for (const suspendedPoll of [true, false]) {
+      const { fake, place, paper, order } = setup();
+      fake.book().inplay = true;
+      fake.setOffers(101, [[3.0, 100]], [[3.05, 80]]);
+      const [bet] = await place([lay(101, 2.0, 50, "PERSIST")]);
+      assert.equal(bet.sizeMatched, 0);
+      fake.trade(101, 1.5, 500); // the horse surges through the lay before the market suspends at the line
+      fake.trade(101, 1.01, 2000);
+      if (suspendedPoll) {
+        fake.book().status = "SUSPENDED";
+        fake.setOffers(101, [], []);
+        await paper.currentOrders();
+      }
+      fake.settle([101]);
+      await paper.currentOrders();
+      const o = order(bet.betId!);
+      assert.deepEqual(o.fills.map((f) => [f.price, f.size]), [[2.0, 50]], `suspended poll: ${suspendedPoll}`);
+      assert.equal(o.sizeLapsed, 0);
+      assert.equal(o.settlement!.outcome, "LOST");
+      assert.equal(o.settlement!.profit, -50);
+    }
+  });
+
+  test("LAPSE orders get volume seen in a pre-off book, but not volume first seen in-play (it cannot be dated)", async () => {
+    const { fake, place, view, order } = setup();
+    const [dated, undated] = await place([back(101, 3.5, 10), back(103, 5.0, 10)]);
+    fake.trade(101, 3.6, 100); // drifts through the back just before the off
+    fake.book().status = "SUSPENDED"; // the suspension at the off, still pre-off
+    assert.equal((await view(dated.betId!))?.sizeMatched, 10);
+    assert.deepEqual(order(dated.betId!).fills.map((f) => [f.price, f.size]), [[3.5, 10]]);
+    fake.book().status = "OPEN";
+    fake.trade(103, 5.1, 100); // before or after the off: the first in-play book cannot tell
+    fake.book().inplay = true;
+    assert.equal(await view(undated.betId!), undefined);
+    assert.equal(order(undated.betId!).sizeLapsed, 10);
+    assert.deepEqual(order(undated.betId!).fills, []);
+  });
+});
+
+describe("paper: out-of-order books", () => {
+  test("a book fetched before an order was placed but processed after it never fills the order", async () => {
+    const { fake, markets, place, order } = setup();
+    fake.setOffers(101, [[3.2, 50], [3.0, 100]], [[3.25, 80]]);
+    const original = fake.listMarketBook.bind(fake);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    fake.listMarketBook = async (args) => {
+      fake.listMarketBook = original;
+      const books = await original(args); // the snapshot is taken when the request is made
+      await gate;
+      return books;
+    };
+    const slowPoll = markets.getBooks([WIN_MARKET], { depth: 1 }); // e.g. a recorder poll whose response is late
+    fake.setOffers(101, [[3.0, 100]], [[3.05, 80]]); // the 3.2 offers are gone
+    const [bet] = await place([back(101, 3.2, 20, "PERSIST")]);
+    assert.equal(bet.sizeMatched, 0);
+    release();
+    await slowPoll;
+    assert.deepEqual(order(bet.betId!).fills, []);
+  });
+
+  test("a book older than an order's placement book is ignored, even after a restart", async () => {
+    const fake = new FakeBetfair();
+    const state = new State();
+    const first = setup({ fake, state });
+    fake.book().version = 7;
+    const [bet] = await first.place([back(101, 3.2, 20, "PERSIST")]);
+    assert.equal(first.order(bet.betId!).bookVersion, 7);
+    // A new process has no book history; a lagging server answers with the market as it was before the order.
+    const second = setup({ fake, state });
+    fake.book().version = 6;
+    fake.setOffers(101, [[3.2, 50], [3.0, 100]], [[3.25, 80]]);
+    assert.equal((await second.view(bet.betId!))!.sizeMatched, 0);
+    fake.book().version = 7;
+    assert.equal((await second.view(bet.betId!))!.sizeMatched, 20);
+  });
+});
+
+describe("paper: dead heats and commission", () => {
+  test("a dead heat divides the stake: the winners' share is settled as a win, the rest as a loss", async () => {
+    const backs = setup();
+    const [b] = await backs.place([back(101, 3.0, 10)]);
+    backs.fake.settle([101, 103]); // two winners of a one-winner market
+    const settledBack = await backs.paper.settledBets(new Date(0));
+    close(settledBack.bets[0].profit, 5); // 10 x 2 x 1/2 - 10 x 1/2
+    assert.equal(settledBack.bets[0].outcome, "WON");
+    close(settledBack.commission!, 0.25);
+    assert.match(String(backs.order(b.betId!).meta!.note), /Dead heat/);
+
+    const lays = setup();
+    await lays.place([lay(103, 4.6, 10)]);
+    lays.fake.settle([101, 103]);
+    close((await lays.paper.settledBets(new Date(0))).bets[0].profit, -13); // -(10 x 3.6 x 1/2) + 10 x 1/2
+
+    const places = setup();
+    await places.place([back(102, 2.38, 10)], PLACE_MARKET);
+    places.fake.settle([101, 102, 103], PLACE_MARKET); // three WINNERs for two places: each keeps 2/3
+    close((await places.paper.settledBets(new Date(0))).bets[0].profit, (13.8 * 2) / 3 - 10 / 3);
+  });
+
+  test("a winner is paid in full whatever its non-runner adjustment factor", async () => {
+    const { fake, place, paper } = setup();
+    await place([back(101, 3.0, 10)]);
+    fake.setRunner(101, { adjustmentFactor: 33.3 }); // Betfair publishes every horse's reduction factor
+    fake.settle([101]);
+    assert.equal((await paper.settledBets(new Date(0))).bets[0].profit, 20);
+  });
+
+  test("commission is charged at the market's base rate, else at the configured rate", async () => {
+    const high = setup();
+    high.fake.catalogues.get(WIN_MARKET)!.description!.marketBaseRate = 10;
+    const [bet] = await high.place([back(101, 3.0, 10)]);
+    assert.equal(high.order(bet.betId!).marketBaseRate, 10);
+    high.fake.settle([101]);
+    close((await high.paper.settledBets(new Date(0))).commission!, 2);
+    assert.equal(high.state.paper.settlements[0].commissionRate, 0.1);
+    assert.equal((await high.paper.accountFunds()).balance, 1018);
+
+    const unknown = setup({ options: { commissionRate: 0.02 } });
+    delete unknown.fake.catalogues.get(WIN_MARKET)!.description!.marketBaseRate;
+    await unknown.place([back(101, 3.0, 10)]);
+    unknown.fake.settle([101]);
+    close((await unknown.paper.settledBets(new Date(0))).commission!, 0.4);
+  });
+});
+
+describe("paper: placement on an out-of-order book", () => {
+  test("an order is never matched against a placement book older than one already processed", async () => {
+    const { fake, markets, place, order } = setup();
+    fake.setOffers(101, [[3.2, 50], [3.0, 100]], [[3.25, 80]]);
+    fake.trade(101, 3.2, 100);
+    const original = fake.listMarketBook.bind(fake);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    let requested!: () => void;
+    const sent = new Promise<void>((resolve) => (requested = resolve));
+    fake.listMarketBook = async (args) => {
+      fake.listMarketBook = original;
+      const books = await original(args); // the placement's snapshot, taken when its request is made
+      requested();
+      await gate;
+      return books;
+    };
+    const placing = place([back(101, 3.2, 20, "PERSIST")]);
+    await sent;
+    fake.setOffers(101, [[3.0, 100]], [[3.05, 80]]); // the 3.2 offers are taken
+    fake.trade(101, 3.2, 50);
+    await markets.getBook(WIN_MARKET); // a later request (e.g. a recorder poll) is answered first
+    release();
+    const [bet] = await placing;
+    assert.equal(bet.sizeMatched, 0, "the vanished 3.2 offers must not match the order");
+    assert.deepEqual(order(bet.betId!).fills, []);
+    fake.trade(101, 3.05, 10);
+    await markets.getBook(WIN_MARKET);
+    assert.deepEqual(order(bet.betId!).fills, [], "volume traded at 3.2 before the order was placed is not evidence for it");
   });
 });
