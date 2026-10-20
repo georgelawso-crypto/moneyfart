@@ -9,7 +9,7 @@ import { FakeBetfair, WIN_MARKET } from "./fakeBetfair.js";
 
 async function connect(env: Record<string, string> = {}) {
   const fake = new FakeBetfair();
-  const connector = new Connector(loadConfig({ RECORD_INTERVAL_SECONDS: "0", BOT_INTERVAL_SECONDS: "0", ...env }), fake);
+  const connector = new Connector(loadConfig({ BETFAIR_JURISDICTION: "com", RECORD_INTERVAL_SECONDS: "0", BOT_INTERVAL_SECONDS: "0", ...env }), fake);
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await createServer(connector, {}).connect(serverTransport);
   const client = new Client({ name: "test", version: "1.0.0" });

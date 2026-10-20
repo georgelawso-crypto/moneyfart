@@ -372,7 +372,7 @@ describe("stored AI context limits", () => {
 });
 
 describe("read-only connector process", () => {
-  const env = { TRADING_MODE: "live", RECORD_INTERVAL_SECONDS: "0", BOT_INTERVAL_SECONDS: "0" };
+  const env = { BETFAIR_JURISDICTION: "com", TRADING_MODE: "live", RECORD_INTERVAL_SECONDS: "0", BOT_INTERVAL_SECONDS: "0" };
   const sel101 = [{ selectionId: 101, handicap: 0 }];
   const placeOrders = (fake: FakeBetfair) => fake.calls.filter((c) => c.method === "placeOrders").length;
 
@@ -471,7 +471,7 @@ describe("read-only connector process", () => {
 });
 
 describe("takeover merge and lock loss (review)", () => {
-  const env = { TRADING_MODE: "live", RECORD_INTERVAL_SECONDS: "0", BOT_INTERVAL_SECONDS: "0" };
+  const env = { BETFAIR_JURISDICTION: "com", TRADING_MODE: "live", RECORD_INTERVAL_SECONDS: "0", BOT_INTERVAL_SECONDS: "0" };
   const sel101 = [{ selectionId: 101, handicap: 0 }];
   const placeOrders = (fake: FakeBetfair) => fake.calls.filter((c) => c.method === "placeOrders").length;
 

@@ -141,6 +141,7 @@ class Run {
         continue;
       }
       this.result.bets.push({ ...bet, selectionName: order.selectionName, role: order.role });
+      if (bet.warning && !this.warnings.includes(bet.warning)) this.warn(bet.warning);
       if (bet.status === "SUCCESS") this.done++;
       else if (bet.status === "UNKNOWN") {
         this.uncertain++;

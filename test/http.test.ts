@@ -33,7 +33,7 @@ const initBody = JSON.stringify({
 });
 
 async function start(env: Record<string, string>, options: Parameters<typeof createHttpServer>[1] = {}) {
-  const connector = new Connector(loadConfig({ RECORD_INTERVAL_SECONDS: "0", BOT_INTERVAL_SECONDS: "0", ...env }), new FakeBetfair());
+  const connector = new Connector(loadConfig({ BETFAIR_JURISDICTION: "com", RECORD_INTERVAL_SECONDS: "0", BOT_INTERVAL_SECONDS: "0", ...env }), new FakeBetfair());
   const server = createHttpServer(connector, options);
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   return { base: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, close: () => server.close(), connector };

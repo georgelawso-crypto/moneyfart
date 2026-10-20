@@ -19,7 +19,7 @@ Betfair AI Trading connector
 Betfair Exchange API
 ```
 
-It runs in **paper trading mode by default**: bets are matched against the live Betfair order book and settled with real results, without real money. Live mode needs `TRADING_MODE=live`.
+It runs in **paper trading mode by default**: bets are matched against the live Betfair order book and settled with real results, without real money. Live mode needs `TRADING_MODE=live` and five risk limits you set yourself. It is set up for **Australian Betfair accounts** by default (see [Australian accounts](#australian-accounts)); `BETFAIR_JURISDICTION=COM` switches to the international/UK exchange.
 
 ## How the reverse engineering was done
 
@@ -76,7 +76,8 @@ Tools that only this connector has:
 | `get_account_funds` | Balance and exposure |
 | `get_bots` / `stop_bot` | Inspect or stop the bots that manage trading positions |
 | `save_strategy_settings` / `delete_strategy_settings` | Update custom settings. Overwriting a built-in needs `overwrite:true`. |
-| `get_connector_status` | Mode, limits, Betfair login and connectivity, delayed-key detection |
+| `get_connector_status` | Mode, jurisdiction, risk limits and today's headroom, Betfair login and connectivity, delayed-data detection |
+| `kill_switch` | Emergency stop (`engage`): no new risk, bots stopped, unmatched bets cancelled. `status` shows the limits, today's settled result, open exposure and headroom. Only you can release it. |
 | `search_strategy_prompts` / `get_strategy_prompt` | Search and load library prompts, with compatibility notes |
 
 The 126 prompts are also exposed as MCP prompts and as `betfair-prompts://` resources. BFExplorer's four MCP resources (`bfexplorer://activeBetfairMarket` etc.) are provided too.
@@ -154,7 +155,14 @@ Paper mode aims to keep paper results honest, so a strategy shouldn't look profi
 ## Safety
 
 - **Paper by default.** In live mode the server instructions tell Claude to confirm bets unless you asked for autonomous execution. Library prompts that place bets are flagged and carry the same note.
-- **Limits:** `MAX_STAKE` and `MAX_LIABILITY` apply to every risk-adding bet, including dutch totals. Closing bets are exempt but sized exactly, and they never reverse a position.
+- **Risk guard:** every order, from any strategy, bot or tool, passes one guard on its way to the paper or live exchange (`src/exchange/guard.ts`). It judges a bet by what it does to the market's worst-case loss (Betfair's exposure rule: matched bets exactly, unmatched ones where they hurt), not by what the caller says it is:
+  - a bet that doesn't raise the worst case (closing a position) always goes through, even with the kill switch on;
+  - a bet that raises it, whatever it is labelled, must fit `MAX_STAKE` and `MAX_LIABILITY` (per bet), `MAX_MARKET_LIABILITY` (the market's worst case afterwards), `MAX_TOTAL_EXPOSURE` (everything open) and `DAILY_LOSS_LIMIT` (today's settled losses plus the worst case of everything open: the most the connector can lose in a day);
+  - placements are checked one at a time, so two requests can't both use the same headroom, and a bet whose outcome is unknown after a timeout counts as open until it is found.
+- **Live mode needs your limits:** with `TRADING_MODE=live` the connector refuses to start until all five limits are set in the environment. Claude can read them but not change them.
+- **Kill switch:** `kill_switch` with `engage` blocks new risk, stops every bot and cancels every unmatched bet; matched positions stay open and can still be closed. Only you can release it, by deleting `DATA_DIR/kill-switch.json` (or restarting, without `DATA_DIR`). Every process sharing `DATA_DIR` sees it, and a damaged file counts as engaged. Once today's settled losses reach `DAILY_LOSS_LIMIT`, the connector also cancels unmatched bets that would add risk and keeps resting closing bets.
+- **Delayed data:** live mode refuses bets that add risk while Betfair sends a market's prices with a delay (a delayed app key, an unfunded account or a throttled live key). Paper mode still fills, but every result says the fill doesn't show what a live bet would have done.
+- **Strategy limits:** strategies also check `MAX_STAKE` and `MAX_LIABILITY` before sending, including dutch totals. Closing bets are sized exactly and never reverse a position.
 - **Idempotent live orders:** each order carries a `customerRef` and `customerOrderRef`. A timeout is checked against Betfair before anything is reported, and an unconfirmed bet is reported as `UNKNOWN` rather than "failed", so the model won't double-bet.
 - **Betfair login:**
   - after a failed login the connector stops trying until `RetryBetfairLogin`, so a wrong password can't lock your account;
@@ -175,7 +183,7 @@ Paper mode aims to keep paper results honest, so a strategy shouldn't look profi
 
 ## Setup
 
-1. Get a Betfair **application key** from [developer.betfair.com](https://developer.betfair.com/). A delayed key works for paper trading, with delayed prices and no traded volumes. It can also place real bets.
+1. Get a Betfair **application key**: Australian accounts follow [Australian accounts](#australian-accounts) below, others go to [developer.betfair.com](https://developer.betfair.com/). A delayed key gets prices up to 3 minutes late and no traded volumes, so paper results on it don't mean much; it can also place real bets.
 2. `npm install && npm run build`, then copy `.env.example` to `.env` and fill it in.
 
 **Claude Code**
@@ -201,10 +209,27 @@ Serve it over HTTPS, then go to **Settings → Connectors → Add custom connect
 
 Things to know about hosting:
 
-- **Region:** Betfair blocks API access from some countries, including the US, so host somewhere Betfair is available to you (e.g. London).
+- **Region:** Betfair only accepts API requests from permitted jurisdictions. Betfair Australia recommends servers in Australia, New Zealand, the UK, Finland or Ireland; US-hosted services, Google's servers included, may be blocked.
 - **One long-lived instance:** run a single always-on process, not serverless. Monitoring, bots and sessions live in the process.
 
 **Existing BFExplorer clients:** `BFEXPLORER_COMPAT=1` serves MCP at `/` on port 10043, the way fast-agent, LM Studio and the upstream C#/Python agents expect.
+
+## Australian accounts
+
+`BETFAIR_JURISDICTION=AU` is the default. It logs in at `identitysso.betfair.com.au` (and `identitysso-cert.betfair.com.au` for certificate login), the endpoints [Betfair Australia](https://betfair-datascientists.github.io/api/apiResources/) gives for Australian customers; the .com ones are a common cause of 403 errors. Betting calls still go to `api.betfair.com`. The paper account is in AUD and times are shown in Sydney time.
+
+**App keys** ([Betfair Australia's guide](https://betfair-datascientists.github.io/api/apiappkey/)):
+
+1. Create your keys with `createDeveloperAppKeys` in the [API visualiser](https://apps.betfair.com.au/visualisers/api-ng-account-operations/). You get two.
+2. The **delayed key** (`1.0-Delay`) works straight away, but its prices are 1–180 seconds late and it has no traded volume. Candles, price history, weight of money and paper fills all depend on traded volume, so use it to check the connector logs in and runs, not to judge a strategy.
+3. The delayed key can place real bets, and Betfair Australia wants at least one bet through it before it activates your live key. Place that bet by hand in Betfair's API demo tools at the minimum stake: the connector refuses live bets that add risk on delayed data.
+4. Apply for the **live key** through [Betfair Australia's webform](https://forms.office.com/r/UiFcZ216wx). Live access stays fee-free as long as you keep betting through it. A live key that only pulls data can have a delay put on it, so weeks of paper trading on the live key without real bets can quietly make its data delayed again (`get_connector_status` shows when that happens).
+
+**Rules that differ in Australia:**
+
+- **No in-play sport:** Australian customers can't bet in-play on sport online, the API included (Betfair takes those bets by phone only). The connector refuses them in paper and live mode, closing bets included, so close sport positions before the off. In-play racing is fine.
+- **Minimum bets:** $5, or less when the bet's payout reaches $30. The library prompts' stakes are written in euros and pounds ("Bet 10 Euro", "Back 2 Euro") and run in your account currency, so the small ones will be refused: raise them in the strategy settings.
+- **Hosting:** a server must be somewhere Betfair accepts API requests from. Your own computer in Australia is fine; for an always-on server, Betfair Australia recommends Australia, New Zealand, the UK, Finland or Ireland.
 
 ## Configuration
 
@@ -212,18 +237,22 @@ Things to know about hosting:
 | --- | --- | --- |
 | `BETFAIR_APP_KEY`, `BETFAIR_USERNAME`, `BETFAIR_PASSWORD` | | Credentials (or `BETFAIR_SESSION_TOKEN`) |
 | `BETFAIR_CERT_FILE`, `BETFAIR_KEY_FILE` | | Non-interactive (certificate) login |
-| `BETFAIR_API_URL`, `BETFAIR_IDENTITY_URL` | .com endpoints | Other jurisdictions (.it, .es) |
+| `BETFAIR_JURISDICTION` | `AU` | `AU` (betfair.com.au: .com.au logins, AUD paper account, Sydney time) or `COM` (international/UK) |
+| `BETFAIR_API_URL`, `BETFAIR_IDENTITY_URL`, `BETFAIR_CERT_IDENTITY_URL` | from `BETFAIR_JURISDICTION` | Endpoint overrides, https only (e.g. .it, .es) |
 | `BETFAIR_KEEPALIVE_MINUTES` | 240 (10 on .it/.es) | Session keepAlive interval |
 | `TRADING_MODE` | `paper` | `live` places real-money bets |
-| `MAX_STAKE`, `MAX_LIABILITY` | 25, 250 | Per-bet limits on risk-adding bets |
-| `PAPER_STARTING_BALANCE`, `PAPER_COMMISSION_RATE`, `PAPER_CURRENCY` | 1000, 0.05, GBP | Paper account (commission rate is the fallback when a market's base rate is unknown) |
+| `MAX_STAKE`, `MAX_LIABILITY` | 25, 250 (paper) | Per bet: back stake; liability (back stake or lay stake × (price − 1)) |
+| `MAX_MARKET_LIABILITY` | 250 (paper) | Worst-case loss of one market |
+| `MAX_TOTAL_EXPOSURE` | 500 (paper) | Worst-case loss of everything open |
+| `DAILY_LOSS_LIMIT` | 250 (paper) | Today's settled losses + the worst case of everything open. Live mode requires all five limits to be set. |
+| `PAPER_STARTING_BALANCE`, `PAPER_COMMISSION_RATE`, `PAPER_CURRENCY` | 1000, 0.05, AUD (GBP for `COM`) | Paper account (commission rate is the fallback when a market's base rate is unknown) |
 | `MIN_BET_SIZE`, `MIN_BET_PAYOUT` | per currency | Override Betfair's minimum bet rules |
 | `RECORD_INTERVAL_SECONDS`, `BOT_INTERVAL_SECONDS` | 30, 5 | Polling of monitored markets / markets with bots |
 | `MAX_MONITORED_MARKETS`, `MAX_RECORDED_MARKETS`, `MAX_TRADES_PER_SELECTION` | 20, 60, 5000 | Memory bounds |
 | `TOOL_NAMES` | `snake` | `snake`, `legacy` (PascalCase) or `both` |
-| `DISPLAY_TIMEZONE` | Europe/London | Zone for data-context times (BFExplorer uses the host's local zone) |
+| `DISPLAY_TIMEZONE` | Australia/Sydney (Europe/London for `COM`) | Zone for data-context times (BFExplorer uses the host's local zone) and for when `DAILY_LOSS_LIMIT`'s day starts |
 | `BFEXPLORER_STRICT` | off | Drop connector additions (e.g. `inPlay` in market TOON) |
-| `DATA_DIR` | | Persistence directory |
+| `DATA_DIR` | | Persistence directory (also holds the kill switch) |
 | `MCP_AUTH_TOKEN`, `HOST`, `PORT` | , 127.0.0.1, 3000 | HTTP transport |
 | `MCP_ALLOWED_ORIGINS` | none | Comma-separated browser origins allowed to call the server |
 | `MCP_MAX_SESSIONS` | 100 | Concurrent HTTP MCP sessions (least recently used evicted; idle sessions expire after 30 minutes) |
@@ -245,7 +274,7 @@ Things to know about hosting:
 ## Development
 
 ```bash
-npm test             # 397 tests: unit, module, MCP end-to-end and HTTP
+npm test             # 422 tests: unit, module, MCP end-to-end and HTTP
 npm run typecheck
 npm run dev          # from source
 npm run sync-prompts # refresh prompts/ from upstream
@@ -257,7 +286,7 @@ npm run sync-prompts # refresh prompts/ from upstream
 | `src/recorder.ts` | Trade reconstruction and aggressor classification |
 | `src/markets.ts` | Catalogues (incl. closed markets), books, monitoring, settled archive, BFExplorer market payload |
 | `src/contexts/` | Data-context providers and envelope |
-| `src/exchange/` | Paper and live exchanges, position maths |
+| `src/exchange/` | Risk guard, paper and live exchanges, position maths |
 | `src/strategies/` | Templates, built-ins, engine, bots |
 | `src/prompts.ts` | Prompt library, tool-name mapping, compatibility |
 | `src/server.ts`, `src/http.ts`, `src/index.ts`, `src/connector.ts` | MCP surface, transports, wiring |

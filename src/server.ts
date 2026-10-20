@@ -638,6 +638,25 @@ export function createServer(connector: Connector, session: SessionContext = sta
   });
 
   defs.push({
+    name: "kill_switch",
+    legacy: "KillSwitch",
+    title: "Kill switch",
+    description:
+      "Connector tool: emergency stop and risk status. action 'engage' blocks every bet that adds risk (closing bets still go through), stops every bot and cancels every unmatched bet on the account (cancelUnmatched:false keeps them); matched positions stay open. Only the account holder can release it, outside this tool. action 'status' shows the limits, today's settled result, open exposure and how much risk may still be added today.",
+    input: {
+      action: z.enum(["engage", "status"]),
+      reason: z.string().max(500).optional().describe("Why it is engaged (shown in every refusal)"),
+      cancelUnmatched: z.boolean().optional().describe("Cancel every unmatched bet when engaging (default true)"),
+    },
+    annotations: BETTING,
+    run: async ({ action, reason, cancelUnmatched }) => {
+      if (action === "status") return { json: await connector.guard.riskStatus() };
+      const report = await connector.engageKillSwitch(reason ?? "engaged with the kill_switch tool", { cancelUnmatched });
+      return { json: { status: true, mode, ...report } };
+    },
+  });
+
+  defs.push({
     name: "get_account_funds",
     legacy: "GetAccountFunds",
     title: "Account funds",
@@ -748,9 +767,15 @@ export function createServer(connector: Connector, session: SessionContext = sta
         json: {
           mode,
           toolNames: naming,
-          limits: { maxStake: config.trading.maxStake, maxLiability: config.trading.maxLiability },
+          jurisdiction: config.betfair.jurisdiction,
+          risk: connector.betfairConfigured ? await connector.guard.riskStatus() : { limits: connector.guard.riskLimits(), killSwitch: connector.killSwitch() },
           betfair,
           delayedApplicationKey: delayed || undefined,
+          delayedData: delayed
+            ? mode === "live"
+              ? "Betfair is sending delayed prices: bets that add risk are refused until it stops (a delayed app key, an unfunded account or a throttled live key)."
+              : "Betfair is sending delayed prices without traded volume: paper fills, candles and volume-based data are not reliable."
+            : undefined,
           paperFunds: mode === "paper" && connector.betfairConfigured ? await exchange.accountFunds().catch((e: Error) => ({ error: e.message })) : undefined,
           activeMarketId: session.activeMarketId,
           monitoredMarkets: [...state.monitored.values()].filter((m) => !m.companionOf).length,
@@ -880,6 +905,10 @@ function instructions(connector: Connector, naming: "snake" | "legacy" | "both")
     mode === "paper"
       ? "PAPER TRADING: executions are simulated against the live Betfair order book and settled with real results. No real money is used."
       : "LIVE TRADING: executions place REAL-MONEY bets on the user's Betfair account. Confirm stakes and selections with the user before executing unless they explicitly asked for autonomous execution.",
+    `Risk limits are enforced on every bet and cannot be changed from here: a refused bet (MAX_STAKE, MAX_MARKET_LIABILITY, MAX_TOTAL_EXPOSURE, DAILY_LOSS_LIMIT, KILL_SWITCH_ENGAGED, DELAYED_DATA) must not be retried in pieces or on other markets to get around it; tell the user. ${n("kill_switch", "KillSwitch")} with action "status" shows what is left today; "engage" stops everything if something looks wrong.`,
+    ...(connector.config.betfair.jurisdiction === "au"
+      ? ["Australian account: bets on in-play sport are refused (Betfair takes those by phone only), so sport positions must be closed before the off. Racing can be bet in-play."]
+      : []),
     `Workflow: ${n("find_markets", "FindMarkets")} -> ${n("open_market", "OpenMarket")} (active market; starts trade recording) -> ${n("get_active_market", "GetActiveMarket")} -> ${n("get_all_data_context_for_market", "GetAllDataContextForMarket")} -> analysis -> ${n("execute_strategy_settings", "ExecuteBfexplorerStrategySettings")}.`,
     "Library prompts name tools in three styles; they are the same tools: GetActiveMarket = get_active_market, GetAllDataContextForMarket = get_all_data_context_for_market, ExecuteBfexplorerStrategySettings = execute_strategy_settings, ExecuteBfexplorerStrategySettingsWithParameters = execute_strategy_settings_with_parameters, SetAIAgentDataContextForBetfairMarket = set_ai_agent_data_context_for_market, ActivateBetfairMarketSelection = activate_market_selection, GetBetfairMonitoredMarkets = get_monitored_markets.",
     "Market tools return TOON text; data contexts return JSON {market, selectionsData:[{selectionId, name, data}], data}. Selection ids are plain strings such as \"98427997\". Always pass marketId explicitly once you know it: other conversations may change the active market.",

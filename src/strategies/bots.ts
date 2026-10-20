@@ -360,6 +360,7 @@ export class BotRunner {
     bot.betIds.push(bet.betId);
     m.entryBetIds.push(bet.betId);
     this.log(bot, `Placed ${bet.side} ${bet.size} @ ${bet.price} (bet ${bet.betId}, matched ${round(bet.sizeMatched ?? 0)}).`);
+    if (bet.warning) this.note(bot, bet.warning);
     this.entryPlaced(bot, m, bet.size, bet.sizeMatched ?? 0, now, Boolean(book.inplay));
   }
 
@@ -637,6 +638,7 @@ export class BotRunner {
     m.closeBetIds.push(bet.betId);
     m.lastCloseAt = now;
     this.log(bot, `Placed closing ${bet.side} ${bet.size} @ ${bet.price} (bet ${bet.betId}, matched ${round(bet.sizeMatched ?? 0)}).`);
+    if (bet.warning) this.note(bot, bet.warning);
     const matched = bet.sizeMatched ?? 0;
     if (matched >= bet.size - 1e-9 && bet.averagePriceMatched) {
       const after = addBet(position, bet.side, bet.averagePriceMatched, matched);

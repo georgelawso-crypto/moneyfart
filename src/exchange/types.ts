@@ -9,7 +9,11 @@ export interface OrderRequest {
   price: number;
   size: number;
   persistenceType: PersistenceType;
-  /** Hedge/offset/close orders: exempt from MAX_STAKE/MAX_LIABILITY (never from Betfair's minimum bet rules). */
+  /**
+   * Hedge/offset/close orders: exempt from MAX_STAKE/MAX_LIABILITY (never from Betfair's minimum bet
+   * rules). The risk guard checks the claim: an order that would raise the market's worst-case loss
+   * is treated as a new bet whatever this says.
+   */
   reducesRisk?: boolean;
   /** Caller-chosen Betfair customerOrderRef (at most 32 characters), so the order can be found again after a restart. */
   customerOrderRef?: string;
@@ -35,6 +39,8 @@ export interface PlacedBet {
   averagePriceMatched?: number;
   orderStatus?: string;
   customerOrderRef?: string;
+  /** Something the caller should pass on, e.g. a paper fill made on delayed data. */
+  warning?: string;
 }
 
 export interface CancelResult {
