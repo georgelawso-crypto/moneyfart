@@ -3,6 +3,7 @@ import { betSizeProblem, type CurrencyRules } from "../betfair/currency.js";
 import { ticksBetween, type LadderType } from "../betfair/ticks.js";
 import type { MarketBook, Runner, Side } from "../betfair/types.js";
 import type { Config } from "../config.js";
+import { guardRefusal } from "../exchange/guard.js";
 import { addBet, greenUpProfit, liability, positionOf, worstCase, type Position } from "../exchange/math.js";
 import type { CancelResult, Exchange, OrderView, StrategyTag } from "../exchange/types.js";
 import { formatSelectionId, marketStatusName, round, runnerStatusName, type SelectionRef } from "../format.js";
@@ -627,6 +628,12 @@ export class BotRunner {
     );
     if (placement.reason) throw new Error(`Closing bet not sent: ${placement.reason}`);
     const bet = placement.bet!;
+    // A refusal by the risk guard can clear (a read that failed, another position closed, the next
+    // day): keep managing the position and try again, rather than counting it as the bot failing.
+    const refusedBy = bet.status === "FAILURE" ? guardRefusal(bet.errorCode) : undefined;
+    if (refusedBy) {
+      return { message: `The closing bet ${order.side} @ ${order.price} was refused by the risk guard (${refusedBy}); trying again on the next tick. ${bet.errorCode}` };
+    }
     if (bet.status === "UNKNOWN") {
       return {
         done: "failed",

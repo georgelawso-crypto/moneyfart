@@ -70,6 +70,8 @@ export interface OrderView {
   /** Strategy setting name (mapped back from customerStrategyRef). */
   strategy?: string;
   customerOrderRef?: string;
+  /** Betfair SP bets: the stake (back) or liability (lay) at risk before the SP is known. */
+  bspLiability?: number;
 }
 
 export interface SettledBetView {

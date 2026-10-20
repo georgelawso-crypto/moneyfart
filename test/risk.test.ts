@@ -107,6 +107,14 @@ describe("live-mode limits", () => {
     assert.doesNotThrow(() => checkLiveSafety(loadConfig({})), "paper mode runs on the defaults");
   });
 
+  test("limits must be plain decimal numbers", () => {
+    for (const value of ["0x10", "1e3", "-5", "five", "10 "]) {
+      if (value.trim() === "10") assert.equal(loadConfig({ MAX_STAKE: value }).trading.maxStake, 10);
+      else assert.throws(() => loadConfig({ MAX_STAKE: value }), /MAX_STAKE must be a non-negative number/, value);
+    }
+    assert.equal(loadConfig({ MAX_STAKE: "12.5" }).trading.maxStake, 12.5);
+  });
+
   test("limits are read from the environment", () => {
     const t = loadConfig(all).trading;
     assert.deepEqual([t.maxStake, t.maxLiability, t.maxMarketLiability, t.maxTotalExposure, t.dailyLossLimit], [10, 50, 50, 100, 50]);
@@ -152,7 +160,7 @@ describe("risk guard: limits that strategies cannot get around", () => {
     // Flagged as closing, but it would reverse the position into a 51.50 loss if 101 wins.
     const [overHedge] = await c.exchange.placeOrders(WIN_MARKET, [order(101, "LAY", 3.05, 30, { reducesRisk: true })], TAG);
     assert.equal(overHedge.status, "FAILURE");
-    assert.match(overHedge.errorCode!, /^MAX_LIABILITY: .*sent as a closing bet, but it would add risk/);
+    assert.match(overHedge.errorCode!, /^MAX_LIABILITY: liability 61.50 exceeds MAX_LIABILITY 25\. \(It was sent as a closing bet, but it doesn't close a position, so it was checked as a new bet\.\)$/);
 
     // The equal-profit hedge never raises the worst case, so it goes through even with the kill switch
     // on, and even without the flag: bets are judged by what they do, not by what they say.
@@ -162,7 +170,7 @@ describe("risk guard: limits that strategies cannot get around", () => {
     assert.equal(hedge.sizeMatched, 9.84);
     // Now flat: any further lay on 101 would be new risk, and the kill switch stops it.
     const [more] = await c.exchange.placeOrders(WIN_MARKET, [order(101, "LAY", 3.05, 5, { reducesRisk: true })], TAG);
-    assert.match(more.errorCode!, /^KILL_SWITCH_ENGAGED: .*sent as a closing bet, but it would add risk/);
+    assert.match(more.errorCode!, /^KILL_SWITCH_ENGAGED: .*It was sent as a closing bet, but it doesn't close a position/);
   });
 
   test("MAX_MARKET_LIABILITY caps the market's worst case across bets and selections", async () => {
@@ -188,7 +196,7 @@ describe("risk guard: limits that strategies cannot get around", () => {
     const { c, fake } = connector({ DAILY_LOSS_LIMIT: "30" });
     assert.equal((await c.exchange.placeOrders(PLACE_MARKET, [order(101, "BACK", 1.5, 10)], TAG))[0].status, "SUCCESS");
     assert.equal((await c.exchange.placeOrders(WIN_MARKET, [order(101, "BACK", 3.0, 20)], TAG))[0].status, "SUCCESS");
-    const [tooMuch] = await c.exchange.placeOrders(PLACE_MARKET, [order(103, "BACK", 1.89, 5)], TAG);
+    const [tooMuch] = await c.exchange.placeOrders(PLACE_MARKET, [order(101, "BACK", 1.5, 5)], TAG);
     assert.match(tooMuch.errorCode!, /^DAILY_LOSS_LIMIT: today's settled loss 0.00 plus an open worst case of 35.00 would exceed DAILY_LOSS_LIMIT 30/);
 
     fake.settle([102]); // the WIN bet loses 20
@@ -198,7 +206,7 @@ describe("risk guard: limits that strategies cannot get around", () => {
     assert.equal(status.headroom, 0);
     assert.equal(status.dailyLimitHit, false);
 
-    const [refused] = await c.exchange.placeOrders(PLACE_MARKET, [order(103, "BACK", 1.89, 5)], TAG);
+    const [refused] = await c.exchange.placeOrders(PLACE_MARKET, [order(101, "BACK", 1.5, 5)], TAG);
     assert.match(refused.errorCode!, /^DAILY_LOSS_LIMIT: today's settled loss 20.00 plus an open worst case of 15.00/);
     const [hedge] = await c.exchange.placeOrders(PLACE_MARKET, [order(101, "LAY", 1.52, 9.87, { reducesRisk: true })], TAG);
     assert.equal(hedge.status, "SUCCESS", JSON.stringify(hedge));
@@ -331,11 +339,12 @@ describe("kill switch", () => {
     );
     const file = path.join(dir, "kill-switch.json");
     assert.ok(fs.existsSync(file));
+    assert.equal(fs.statSync(file).mode & 0o777, 0o600, "only the account holder's user can read or change it");
     assert.equal(report.release, `delete ${file}`);
     assert.equal(owner.bots.list({ status: "running" }).length, 0);
 
     const [blocked] = await owner.exchange.placeOrders(WIN_MARKET, [order(101, "BACK", 3.0, 5)], TAG);
-    assert.match(blocked.errorCode!, /^KILL_SWITCH_ENGAGED: .*\(too many losses\)\. Closing bets still go through\. Only the account holder can release it: delete /);
+    assert.match(blocked.errorCode!, /^KILL_SWITCH_ENGAGED: .*\(too many losses\)\. Bets that close positions still go through\. Only the account holder can release it: delete /);
     // Engaging again keeps the first reason.
     assert.equal(owner.guard.engageKillSwitch("again").reason, "too many losses");
     owner.shutdown();
@@ -347,6 +356,23 @@ describe("kill switch", () => {
     fs.rmSync(file); // the account holder releases it
     assert.equal((await next.exchange.placeOrders(WIN_MARKET, [order(101, "BACK", 3.0, 5)], TAG))[0].status, "SUCCESS");
     next.shutdown();
+  });
+
+  test("a kill switch engaged by another process stops this process's bots on its next bot tick", async () => {
+    const dir = tmpDir();
+    const c = new Connector(loadConfig({ BETFAIR_JURISDICTION: "com", RECORD_INTERVAL_SECONDS: "0", BOT_INTERVAL_SECONDS: "0", DATA_DIR: dir }), new FakeBetfair());
+    const started = await c.executeStrategy("Bet 10 Euro", WIN_MARKET, sel101, { PlaceBetTimeSpan: "-0:25:00" });
+    assert.equal(started.outcome, "Started", JSON.stringify(started));
+    fs.writeFileSync(path.join(dir, "kill-switch.json"), JSON.stringify({ engagedAt: new Date().toISOString(), reason: "from the other window" }));
+    const original = console.error;
+    console.error = () => undefined;
+    try {
+      await c.botTick();
+    } finally {
+      console.error = original;
+    }
+    assert.equal(c.bots.list({ status: "running" }).length, 0);
+    c.shutdown();
   });
 
   test("a damaged kill switch file counts as engaged", async () => {

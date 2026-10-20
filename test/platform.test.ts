@@ -407,7 +407,7 @@ describe("read-only connector process", () => {
     reader.shutdown();
   });
 
-  test("refuses strategies that start a bot before placing anything; plain bets still run", async () => {
+  test("refuses strategies that start a bot before placing anything, and bets that add risk", async () => {
     const { owner, reader, fake } = await pair();
     for (const [name, overrides] of [
       ["Trade x profit", {}],
@@ -424,11 +424,14 @@ describe("read-only connector process", () => {
     assert.equal(placeOrders(fake), 0);
     assert.equal(reader.state.bots.length, 1, "no bot was added");
 
+    // Plain bets are refused too: two processes checking the same headroom at once could both use it,
+    // so only the process that owns DATA_DIR adds risk (closing bets still go through here).
     const now = await reader.executeStrategy("Bet 10 Euro", WIN_MARKET, sel101);
-    assert.equal(now.status, true, JSON.stringify(now));
+    assert.equal(now.status, false, JSON.stringify(now));
+    assert.match(now.message!, /READ_ONLY_PROCESS: this connector process doesn't own DATA_DIR/);
     const past = await reader.executeStrategy("Bet 10 Euro", WIN_MARKET, sel101, { PlaceBetTimeSpan: "-0:35:00" });
-    assert.equal(past.status, true, "a PlaceBetTimeSpan already passed places the bet now");
-    assert.equal(placeOrders(fake), 2);
+    assert.equal(past.status, false, "a PlaceBetTimeSpan already passed would place the bet now: refused the same way");
+    assert.equal(placeOrders(fake), 0);
 
     // The engine itself cannot register a bot here either.
     const direct = await reader.strategies.execute("Bet 10 Euro", WIN_MARKET, sel101, { PlaceBetTimeSpan: "-0:25:00" });

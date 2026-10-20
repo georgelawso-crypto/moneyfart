@@ -642,7 +642,7 @@ export function createServer(connector: Connector, session: SessionContext = sta
     legacy: "KillSwitch",
     title: "Kill switch",
     description:
-      "Connector tool: emergency stop and risk status. action 'engage' blocks every bet that adds risk (closing bets still go through), stops every bot and cancels every unmatched bet on the account (cancelUnmatched:false keeps them); matched positions stay open. Only the account holder can release it, outside this tool. action 'status' shows the limits, today's settled result, open exposure and how much risk may still be added today.",
+      "Connector tool: emergency stop and risk status. action 'engage' blocks every bet except ones that close positions, stops every bot and cancels every unmatched bet on the account (cancelUnmatched:false keeps them); matched positions stay open (close a market's positions with Close Market Bet Position). Only the account holder can release it, outside this tool. action 'status' shows the limits, today's settled result, open exposure and how much risk may still be added today.",
     input: {
       action: z.enum(["engage", "status"]),
       reason: z.string().max(500).optional().describe("Why it is engaged (shown in every refusal)"),

@@ -121,6 +121,11 @@ export class Connector {
       jurisdiction: config.betfair.jurisdiction,
       timeZone: config.output.displayTimeZone,
       dataDir: config.dataDir,
+      // Two processes checking the same headroom at once could both use it: only the DATA_DIR owner adds risk.
+      addRiskBlocked: () =>
+        this.state.ownsDataDir()
+          ? undefined
+          : `this connector process doesn't own DATA_DIR (${this.state.readOnlyReason ?? "another connector process does"}), so it only places bets that close positions. Use the session connected to the owning process, or close it.`,
     });
     this.exchange = this.guard;
     const deps = { markets: this.markets, exchange: this.exchange, state: this.state, limits: config.trading };
@@ -233,58 +238,77 @@ export class Connector {
   }
 
   /**
-   * Emergency stop: no new risk-adding bet anywhere (closing bets still go through), every bot
+   * Emergency stop: no new risk anywhere (bets that close positions still go through), every bot
    * stopped and every unmatched bet on the account cancelled. Matched positions stay as they are.
-   * Releasing is left to the account holder (see GuardedExchange.killSwitchReleaseHint).
+   * Never fails open: the switch is on in this process before anything else is tried, and each
+   * later step's failure is reported instead of stopping the rest. Releasing is left to the
+   * account holder (see GuardedExchange.killSwitchReleaseHint).
    */
   async engageKillSwitch(reason: string, options: { cancelUnmatched?: boolean } = {}): Promise<KillSwitchReport> {
-    const killSwitch = this.guard.engageKillSwitch(reason);
+    const { fileError, ...killSwitch } = this.guard.engageKillSwitch(reason);
     const notes: string[] = [];
+    if (fileError) {
+      notes.push(`The kill switch could not be saved in DATA_DIR (${fileError}): it holds in this process until it restarts, but other processes sharing DATA_DIR don't see it.`);
+    }
     let botsStopped = 0;
-    if (this.state.ownsDataDir()) botsStopped = await this.bots.stopAll();
-    else notes.push("Bots run in the process that owns DATA_DIR; it stops them within 30 seconds.");
+    if (this.state.ownsDataDir()) {
+      try {
+        botsStopped = await this.bots.stopAll();
+      } catch (error) {
+        notes.push(`Could not stop the bots: ${(error as Error).message}. They can't add risk while the kill switch is on; stop them with stop_bot.`);
+      }
+    } else notes.push("Bots run in the process that owns DATA_DIR; it stops them within a few seconds.");
     let cancelled: KillSwitchReport["cancelled"] = [];
     if (options.cancelUnmatched !== false) {
       try {
-        cancelled = await this.guard.cancelAllUnmatched();
+        const report = await this.guard.cancelAllUnmatched();
+        cancelled = report.cancelled;
+        if (report.failures.length) notes.push(`Some unmatched bets could not be cancelled (${report.failures.join("; ")}): check get_current_orders and cancel them with cancel_bets.`);
       } catch (error) {
-        notes.push(`Could not cancel the unmatched bets: ${(error as Error).message}. Check get_current_orders and cancel them with cancel_bets.`);
+        notes.push(`Could not read the unmatched bets to cancel them (${(error as Error).message}): check get_current_orders and cancel them with cancel_bets.`);
       }
     }
-    notes.push("Matched positions are still open: close them with a closing strategy (allowed while the kill switch is on) or on Betfair.");
+    notes.push(
+      "Matched positions are still open. Bets that close them still go through: Close Market Bet Position (or Close Selection Bet Position), or close them on Betfair. Closing one selection on its own is refused when it would raise the market's worst case; close the whole market instead.",
+    );
     return { killSwitch, release: this.guard.killSwitchReleaseHint(), botsStopped, cancelled, notes };
   }
 
   /**
    * Run by the process that owns DATA_DIR every 30 s: stops bots after a kill switch engaged
    * elsewhere, and once today's settled losses reach DAILY_LOSS_LIMIT cancels the unmatched bets
-   * that would add risk (resting closing bets stay so positions can still be closed).
+   * that would add risk (resting closing bets stay so positions can still be closed). A day counts
+   * as handled only once every cancel has gone through.
    */
   async riskCheck() {
     if (this.riskChecking || !this.betfairConfigured || !this.state.ownsDataDir()) return;
     this.riskChecking = true;
     try {
-      if (this.guard.killSwitch() && this.bots.list({ status: "running" }).length) {
-        const stopped = await this.bots.stopAll();
-        console.error(`[risk] kill switch engaged: stopped ${stopped} bot(s).`);
-      }
+      await this.stopBotsIfKilled();
       const day = startOfDay(Date.now(), this.config.output.displayTimeZone);
       if (this.dailyLimitHandled === day) return;
       // Only unmatched bets need acting on: while there are none, one cheap read is enough.
-      const unmatched = (await this.exchange.currentOrders()).some((o) => o.sizeRemaining > 0);
-      if (unmatched && (await this.guard.dailyLimitHit())) {
-        this.dailyLimitHandled = day;
-        const cancelled = await this.guard.cancelRiskAddingUnmatched();
-        console.error(
-          `[risk] DAILY_LOSS_LIMIT ${this.config.trading.dailyLossLimit} reached: no new risk until midnight (${this.config.output.displayTimeZone}); ` +
-            `cancelled ${cancelled.filter((c) => c.status === "SUCCESS").length} unmatched bet(s) that would have added risk.`,
-        );
-      }
+      const unmatched = (await this.exchange.currentOrders()).some((o) => o.sizeRemaining > 0 || (o.bspLiability ?? 0) > 0);
+      if (!unmatched || (await this.guard.dailyLimitHit()) !== true) return;
+      const report = await this.guard.cancelRiskAddingUnmatched();
+      const done = report.cancelled.filter((c) => c.status === "SUCCESS").length;
+      console.error(
+        `[risk] DAILY_LOSS_LIMIT ${this.config.trading.dailyLossLimit} reached: no new risk until midnight (${this.config.output.displayTimeZone}); ` +
+          `cancelled ${done} unmatched bet(s) that would have added risk${report.failures.length ? `; failed: ${report.failures.join("; ")} (retried in 30 s)` : ""}.`,
+      );
+      if (!report.failures.length) this.dailyLimitHandled = day;
     } catch (error) {
       console.error(`[risk] ${(error as Error).message}`);
     } finally {
       this.riskChecking = false;
     }
+  }
+
+  /** Stop every running bot once a kill switch is on (engaged here, in another process, or as a damaged file). */
+  private async stopBotsIfKilled() {
+    if (!this.guard.killSwitch() || !this.bots.list({ status: "running" }).length) return;
+    const stopped = await this.bots.stopAll();
+    console.error(`[risk] kill switch engaged: stopped ${stopped} bot(s).`);
   }
 
   /** Markets polled by the recorder: open monitored markets plus markets with unsettled paper orders. */
@@ -311,7 +335,9 @@ export class Connector {
     if (this.botTicking || !this.bots.marketIds().length || !this.state.ownsDataDir()) return;
     this.botTicking = true;
     try {
-      await this.bots.tick();
+      // A kill switch engaged in another process: stop rather than tick (the guard already refuses their new risk).
+      if (this.guard.killSwitch()) await this.stopBotsIfKilled();
+      else await this.bots.tick();
     } catch (error) {
       console.error(`[bots] ${(error as Error).message}`);
     } finally {

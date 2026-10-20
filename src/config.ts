@@ -138,7 +138,8 @@ function num(env: NodeJS.ProcessEnv, name: string, fallback?: undefined): number
 function num(env: NodeJS.ProcessEnv, name: string, fallback?: number): number | undefined {
   const raw = str(env, name);
   if (raw === undefined) return fallback;
-  const value = Number(raw);
+  // Plain decimals only: Number() would also read "0x10" as 16 or "1e3" as 1000.
+  const value = /^(\d+(\.\d*)?|\.\d+)$/.test(raw) ? Number(raw) : Number.NaN;
   if (!Number.isFinite(value) || value < 0) {
     throw new Error(`${name} must be a non-negative number, got "${raw}"`);
   }
@@ -172,9 +173,9 @@ function validTimeZone(zone: string): string {
 
 function jurisdictionOf(env: NodeJS.ProcessEnv): Jurisdiction {
   const raw = str(env, "BETFAIR_JURISDICTION") ?? "au";
-  const jurisdiction = JURISDICTION_NAMES[raw.toLowerCase()];
-  if (!jurisdiction) throw new Error(`BETFAIR_JURISDICTION must be AU (betfair.com.au) or COM (international/UK), got "${raw}"`);
-  return jurisdiction;
+  const name = raw.toLowerCase();
+  if (!Object.hasOwn(JURISDICTION_NAMES, name)) throw new Error(`BETFAIR_JURISDICTION must be AU (betfair.com.au) or COM (international/UK), got "${raw}"`);
+  return JURISDICTION_NAMES[name];
 }
 
 /** Endpoint override: an https URL without trailing slashes. */

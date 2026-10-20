@@ -372,6 +372,7 @@ export class LiveExchange implements Exchange {
       matchedDate: o.matchedDate,
       strategy: this.state.strategyNameForRef(o.customerStrategyRef),
       customerOrderRef: o.customerOrderRef,
+      ...(o.bspLiability ? { bspLiability: o.bspLiability } : {}),
     };
   }
 
