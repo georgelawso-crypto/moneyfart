@@ -24,6 +24,11 @@ export interface Leg {
   remaining: number;
   /** An SP bet not matched yet: a back loses this stake if the selection loses, a lay this liability if it wins. */
   spLiability?: number;
+  /**
+   * The placement's outcome is unknown, so it may have matched at once at a better price than its
+   * limit: a back can win up to price 1000 (a lay's liability can only be lower, its winnings the same).
+   */
+  improvable?: boolean;
 }
 
 export interface MarketShape {
@@ -84,8 +89,9 @@ export function scenarioLosses(legs: Leg[], shape: MarketShape, extra: string[] 
       let matched = 0;
       for (const f of leg.fills) matched += betOutcomeProfit(leg.side, f.price, f.size, wins);
       const rest = leg.remaining > 0 && leg.price >= 1.01 ? betOutcomeProfit(leg.side, leg.price, leg.remaining, wins) : 0;
+      const best = leg.improvable && leg.side === "BACK" && wins && leg.remaining > 0 ? leg.remaining * 999 : rest;
       hurt -= matched + Math.min(0, rest);
-      help -= matched + Math.max(0, rest);
+      help -= matched + Math.max(0, best);
     }
     return { winners, hurt, help };
   });
@@ -227,4 +233,73 @@ export function closingVerdict(known: Leg[], shape: MarketShape, legs: Leg[]): C
     closing: false,
     why: "on its own it could raise the market's worst case (for example lays on two runners that cover each other, or unmatched bets on other runners that this position covers)",
   };
+}
+
+// ------------------------------------------------------------------ what a request can add
+
+/** Most outcomes worth comparing pairwise for addedBound (beyond that, callers use the request's own worst loss). */
+const MAX_BOUND_SCENARIOS = 256;
+
+/**
+ * Most a request can add to its market's worst-case loss, whatever happens meanwhile to the market's
+ * other uncertain bets (matched, cancelled or lapsing, in any part) and however much of the request
+ * matches. For each outcome s it is what the request can lose there, minus the least the market's
+ * worst case is always ahead of s: zero minus s's highest possible loss (a worst case is never
+ * negative), and for every other outcome t, (matched loss in t - in s) plus, per uncertain bet, the
+ * least (its loss in t - its loss in s) can be. Undefined when the outcomes can't be enumerated (or
+ * are too many), or an unmatched SP bet is involved.
+ */
+export function addedBound(known: Leg[], shape: MarketShape, request: Leg[]): number | undefined {
+  const removed = new Set(shape.removed ?? []);
+  const live = known.filter((l) => !removed.has(l.key));
+  const asked = request.filter((l) => !removed.has(l.key));
+  if (live.some((l) => (l.spLiability ?? 0) > 0)) return undefined;
+  const keys = [...new Set([...live, ...asked].map((l) => l.key))];
+  const sets = winnerSets(keys, shape);
+  if (!sets || sets.length > MAX_BOUND_SCENARIOS) return undefined;
+  const n = sets.length;
+  const matched = new Array<number>(n).fill(0);
+  const asks = new Array<number>(n).fill(0);
+  /** Per uncertain bet and outcome: its lowest and highest possible loss there (better prices included). */
+  const uncertain: Array<{ low: number[]; high: number[] }> = [];
+  sets.forEach((winners, s) => {
+    for (const leg of live) {
+      const wins = winners.has(leg.key);
+      for (const f of leg.fills) matched[s] -= betOutcomeProfit(leg.side, f.price, f.size, wins);
+    }
+    for (const leg of asked) {
+      if (leg.remaining > 0) asks[s] += Math.max(0, -betOutcomeProfit(leg.side, leg.price, leg.remaining, winners.has(leg.key)));
+    }
+  });
+  for (const leg of live) {
+    if (!(leg.remaining > 0) || !(leg.price >= 1.01)) continue;
+    const low: number[] = [];
+    const high: number[] = [];
+    for (const winners of sets) {
+      const wins = winners.has(leg.key);
+      const atLimit = -betOutcomeProfit(leg.side, leg.price, leg.remaining, wins);
+      // A possibly-placed bet may have matched at once at a better price: a back wins up to price 1000,
+      // a lay's liability can be lower (down to nothing); losses and stakes won are otherwise fixed.
+      const best = leg.improvable && wins ? (leg.side === "BACK" ? -leg.remaining * 999 : 0) : atLimit;
+      low.push(Math.min(atLimit, best));
+      high.push(atLimit);
+    }
+    uncertain.push({ low, high });
+  }
+  let bound = 0;
+  for (let s = 0; s < n; s++) {
+    if (asks[s] <= 0) continue;
+    // A worst case is never below zero (no loss): outcome s is at least its own loss short of it.
+    let highest = matched[s];
+    for (const u of uncertain) highest += Math.max(0, u.high[s]);
+    let slack = Math.max(0, -highest);
+    for (let t = 0; t < n; t++) {
+      if (t === s) continue;
+      let ahead = matched[t] - matched[s];
+      for (const u of uncertain) ahead += Math.min(0, u.low[t] - u.high[s]);
+      if (ahead > slack) slack = ahead;
+    }
+    bound = Math.max(bound, asks[s] - slack);
+  }
+  return bound;
 }

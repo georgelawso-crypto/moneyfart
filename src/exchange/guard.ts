@@ -26,9 +26,9 @@ import path from "node:path";
 import type { CurrencyRules } from "../betfair/currency.js";
 import type { MarketBook, MarketCatalogue } from "../betfair/types.js";
 import type { Config, Jurisdiction } from "../config.js";
-import { assertMarketId, formatSelectionId, round } from "../format.js";
+import { assertMarketId, formatSelectionId, round, sameSelection } from "../format.js";
 import type { MarketService } from "../markets.js";
-import { closingVerdict, enumerable, legLiability, worstLoss, type Closing, type Leg, type MarketShape } from "./exposure.js";
+import { addedBound, closingVerdict, enumerable, legLiability, worstLoss, type Closing, type Leg, type MarketShape } from "./exposure.js";
 import { liability } from "./math.js";
 import type { CancelResult, Exchange, FundsView, OrderRequest, OrderView, PlacedBet, SettledBets, StrategyTag } from "./types.js";
 
@@ -50,6 +50,11 @@ export interface RiskOptions {
 export interface KillSwitchState {
   engagedAt: string;
   reason: string;
+  /**
+   * The file could not be read (not absent, not damaged): new risk is refused meanwhile, but
+   * nothing irreversible (stopping bots, cancelling bets) is done on it, as the error may clear.
+   */
+  unreadable?: true;
 }
 
 export interface RiskStatus {
@@ -83,6 +88,8 @@ export interface CancelReport {
 
 /** Refusals that will not clear while the market lasts (a bot stops retrying them). */
 export const PERMANENT_REFUSALS = new Set(["IN_PLAY_SPORT_NOT_ALLOWED", "INVALID_ORDER"]);
+/** Refusals caused by a read that failed: a bot tries its entry again rather than giving up. */
+export const TRANSIENT_REFUSALS = new Set(["RISK_CHECK_FAILED", "KILL_SWITCH_UNREADABLE"]);
 
 /** The guard's refusal code of a bet it refused, or undefined (Betfair's own codes are never read as one). */
 export function guardRefusal(bet: Pick<PlacedBet, "refusedBy" | "errorCode">): string | undefined {
@@ -109,6 +116,11 @@ function legOfView(o: OrderView): Leg {
 /** A new order as a leg: nothing matched yet (it may all match, or any part of it). */
 function legOfOrder(o: OrderRequest): Leg {
   return { key: keyOf(o), side: o.side, price: o.price, remaining: o.size, fills: [] };
+}
+
+/** The most an order can lose on its own, whatever else happens in its market. */
+function ownWorstLoss(legs: Leg[], shape: MarketShape): number {
+  return worstLoss(legs, shape, "hurt");
 }
 
 function refused(order: OrderRequest, errorCode: string): PlacedBet {
@@ -166,7 +178,7 @@ export function startOfDay(now: number, timeZone: string): number {
 
 // ------------------------------------------------------------------ kill switch
 
-type FileRead = { state: KillSwitchState } | { absent: true } | { broken: string };
+type FileRead = { state: KillSwitchState } | { absent: true } | { broken: string; unreadable?: true };
 
 /**
  * Kill switch flag. With DATA_DIR it is a file every process sharing DATA_DIR reads, and deleting
@@ -186,7 +198,7 @@ class KillSwitchStore {
       text = fs.readFileSync(this.file!, "utf8");
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return { absent: true };
-      return { broken: `the kill switch file could not be read (${(error as Error).message}), so it counts as engaged` };
+      return { broken: `the kill switch file could not be read (${(error as Error).message}), so it counts as engaged until it can be`, unreadable: true };
     }
     try {
       const parsed = JSON.parse(text) as Partial<KillSwitchState>;
@@ -204,7 +216,8 @@ class KillSwitchStore {
       this.memory = undefined; // released by deleting the file
       return undefined;
     }
-    return "state" in read ? read.state : { engagedAt: "", reason: read.broken };
+    if ("state" in read) return read.state;
+    return { engagedAt: "", reason: read.broken, ...(read.unreadable ? { unreadable: true as const } : {}) };
   }
 
   engage(state: KillSwitchState): KillSwitchState & { fileError?: string } {
@@ -368,6 +381,7 @@ export class GuardedExchange implements Exchange {
   /** Why a request that adds risk can't be sent at all right now (kill switch, read-only process), or undefined. */
   private blockedNow(): string | undefined {
     const kill = this.killSwitch();
+    if (kill?.unreadable) return `KILL_SWITCH_UNREADABLE: ${kill.reason}; nothing that adds risk is sent meanwhile. Try again.`;
     if (kill) {
       return `KILL_SWITCH_ENGAGED: no new risk${kill.engagedAt ? ` since ${kill.engagedAt}` : ""} (${kill.reason}). Bets that close a position still go through. Only the account holder can release it: ${this.killSwitchReleaseHint()}.`;
     }
@@ -375,9 +389,8 @@ export class GuardedExchange implements Exchange {
     return blocked ? `READ_ONLY_PROCESS: ${blocked}` : undefined;
   }
 
-  private async guardedPlace(marketId: string, orders: OrderRequest[], strategy: StrategyTag): Promise<PlacedBet[]> {
-    if (!orders.length) return [];
-    const invalid = orders.map(invalidOrder);
+  private async guardedPlace(marketId: string, requested: OrderRequest[], strategy: StrategyTag): Promise<PlacedBet[]> {
+    if (!requested.length) return [];
 
     let market: MarketRisk;
     try {
@@ -385,8 +398,23 @@ export class GuardedExchange implements Exchange {
     } catch (error) {
       // Without the positions nothing can be shown to close one: refuse everything, the caller retries.
       const reason = `RISK_CHECK_FAILED: could not read the market or its orders (${(error as Error).message}); nothing was sent. Try again.`;
-      return orders.map((order, i) => refused(order, invalid[i] ? `INVALID_ORDER: ${invalid[i]}` : reason));
+      return requested.map((order) => refused(order, invalidOrder(order) ? `INVALID_ORDER: ${invalidOrder(order)}` : reason));
     }
+    // Every order is sent as the market's own runner (exact selection id and handicap), so it is
+    // judged with the same key as the bets already on that runner.
+    const orders = requested.map((order) => {
+      const runner = market.book.runners.find((r) => sameSelection({ selectionId: r.selectionId, handicap: r.handicap ?? 0 }, { selectionId: order.selectionId, handicap: order.handicap ?? 0 }));
+      return runner ? { ...order, selectionId: runner.selectionId, handicap: runner.handicap ?? 0 } : order;
+    });
+    const invalid = orders.map((order) => {
+      const problem = invalidOrder(order);
+      if (problem) return problem;
+      const runner = market.book.runners.find((r) => r.selectionId === order.selectionId && (r.handicap ?? 0) === order.handicap);
+      if (!runner) return `selection ${keyOf(order)} is not a runner in this market`;
+      if (runner.status !== "ACTIVE") return `selection ${keyOf(order)} is not an active runner (${runner.status})`;
+      return undefined;
+    });
+    const bettingType = market.catalogue?.description?.bettingType ?? "ODDS";
 
     const sportInPlay =
       this.options.jurisdiction === "au" && Boolean(market.book.inplay) && !RACING_EVENT_TYPES.has(market.catalogue?.eventType?.id ?? "");
@@ -395,6 +423,17 @@ export class GuardedExchange implements Exchange {
       const reason = market.catalogue
         ? "IN_PLAY_SPORT_NOT_ALLOWED: Australian customers can't bet in-play on sport online, including through the API (Betfair only takes those bets by phone). Close sport positions before the off."
         : "IN_PLAY_SPORT_NOT_ALLOWED: the market is in-play and its sport could not be read; Australian customers can't bet in-play on sport online, so nothing was sent.";
+      verdict = { problems: orders.map(() => reason), addsRisk: false };
+    } else if (!market.catalogue) {
+      const reason = "RISK_CHECK_FAILED: the market's description could not be read; nothing was sent. Try again.";
+      verdict = { problems: orders.map(() => reason), addsRisk: false };
+    } else if (bettingType !== "ODDS") {
+      // Line and handicap markets don't price bets as odds: the guard's maths would not hold there.
+      const reason = `INVALID_ORDER: this is a ${bettingType} market; the connector only places bets on fixed-odds (ODDS) markets.`;
+      verdict = { problems: orders.map(() => reason), addsRisk: false };
+    } else if (market.catalogue.description?.marketType === "EACH_WAY") {
+      // An each-way bet is two bets (win and place at a fraction of the odds): not what the guard models.
+      const reason = "INVALID_ORDER: this is an each-way market; the connector's risk model only covers win-or-lose bets, so it doesn't bet on them.";
       verdict = { problems: orders.map(() => reason), addsRisk: false };
     } else if (invalid.some(Boolean)) {
       verdict = {
@@ -448,7 +487,7 @@ export class GuardedExchange implements Exchange {
       const warning = [delayedPaper, bet.betId ? cancelNotes?.get(bet.betId) : undefined].filter(Boolean).join(" ");
       results[i] = warning ? { ...bet, warning } : bet;
       if (bet.status === "UNKNOWN") {
-        this.unconfirmed.push({ marketId, leg: legOfOrder(orders[i]), ref: bet.customerOrderRef ?? orders[i].customerOrderRef, until: this.now() + UNCONFIRMED_MS });
+        this.unconfirmed.push({ marketId, leg: { ...legOfOrder(orders[i]), improvable: true }, ref: bet.customerOrderRef ?? orders[i].customerOrderRef, until: this.now() + UNCONFIRMED_MS });
       }
     });
 
@@ -534,17 +573,21 @@ export class GuardedExchange implements Exchange {
     // when the outcomes can't be enumerated).
     const known = [...market.legs, ...market.phantoms];
     const all_ = [...known, ...legs];
-    const exact = enumerable(all_.map((l) => l.key), market.shape);
-    const before = worstLoss(known, market.shape, "hurt");
-    const after = worstLoss(all_, market.shape, "hurt");
+    const shape: MarketShape = legs.some((l) => l.key.includes("_")) ? { ...market.shape, winners: undefined } : market.shape;
+    const exact = enumerable(all_.map((l) => l.key), shape);
+    const before = worstLoss(known, shape, "hurt");
+    const after = worstLoss(all_, shape, "hurt");
     if (after > limits.maxMarketLiability + EPS) {
       return all(
         `MAX_MARKET_LIABILITY: this would take the market's worst-case loss from ${money(before)} to ${money(after)}, above MAX_MARKET_LIABILITY ${limits.maxMarketLiability}.`,
       );
     }
-    // What the exchange's exposure figure doesn't show yet: this request and the market's possibly-placed
-    // bets. With an upper bound only the whole bound is safe to add (the difference of two bounds isn't one).
-    const added = exact ? Math.max(0, after - worstLoss(market.legs, market.shape, "hurt")) : after;
+    // What this request can add to the account's worst case, whatever happens meanwhile to the market's
+    // other bets (an unmatched one cancelled or lapsing while this request is on its way must not free
+    // its headroom): its own worst loss, or less where the market's matched bets cover it for sure.
+    let added = ownWorstLoss(legs, shape);
+    const bound = exact ? addedBound(known, shape, legs) : undefined;
+    if (bound !== undefined) added = Math.min(added, bound);
 
     // Account and day: one request at a time, with requests still on their way reserved.
     return this.withAccountQueue(async (): Promise<Verdict> => {
@@ -556,8 +599,8 @@ export class GuardedExchange implements Exchange {
         else pending += r.amount;
       }
       const now = this.now();
-      // Possibly-placed bets on other markets: the exchange's figure doesn't include them either.
-      for (const u of this.unconfirmed) if (u.until > now && u.marketId !== market.book.marketId) pending += legLiability(u.leg);
+      // Possibly-placed bets: the exchange's figure may not include them yet.
+      for (const u of this.unconfirmed) if (u.until > now) pending += legLiability(u.leg);
       let account: AccountRisk;
       try {
         account = await this.accountRisk();
@@ -587,7 +630,8 @@ export class GuardedExchange implements Exchange {
   }
 
   private closes(market: MarketRisk, legs: Leg[]): Closing {
-    return closingVerdict([...market.legs, ...market.phantoms], market.shape, legs);
+    const shape: MarketShape = legs.some((l) => l.key.includes("_")) ? { ...market.shape, winners: undefined } : market.shape;
+    return closingVerdict([...market.legs, ...market.phantoms], shape, legs);
   }
 
   /** The market's book, catalogue and orders, plus orders whose outcome is unknown. Throws when the book or orders cannot be read. */

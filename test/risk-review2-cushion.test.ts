@@ -16,7 +16,9 @@ import { betOutcomeProfit } from "../src/exchange/math.js";
 import type { OrderView } from "../src/exchange/types.js";
 import { FakeBetfair, WIN_MARKET } from "./fakeBetfair.js";
 
-const LIMITS = { MAX_STAKE: "25", MAX_LIABILITY: "250", MAX_MARKET_LIABILITY: "60", MAX_TOTAL_EXPOSURE: "100", DAILY_LOSS_LIMIT: "100" };
+// MAX_TOTAL_EXPOSURE / DAILY_LOSS_LIMIT 120: the third resting lay is charged 60 (what it can add if the
+// other two match, whatever else happens) on top of the 55 open, so 100 would refuse the setup itself.
+const LIMITS = { MAX_STAKE: "25", MAX_LIABILITY: "250", MAX_MARKET_LIABILITY: "60", MAX_TOTAL_EXPOSURE: "120", DAILY_LOSS_LIMIT: "120" };
 const sel = (selectionId: number) => [{ selectionId, handicap: 0 }];
 
 /** True worst case of a single-winner market of 101/102/103: matched bets, unmatched ones only where they lose. */
@@ -65,9 +67,9 @@ describe("review 2: a 'closing' bet that removes a cushion skips every limit", (
     fake.settle([102]);
     const status = await c.guard.riskStatus();
     assert.ok(
-      -(status.settledToday ?? 0) <= 100 + 1e-9,
+      -(status.settledToday ?? 0) <= 120 + 1e-9,
       `the close (${close.bets.map((b) => `${b.side} ${b.size} @ ${b.price} ${b.status}`).join(", ")}) took the market's worst case from ` +
-        `${before.toFixed(2)} to ${after.toFixed(2)} (MAX_MARKET_LIABILITY 60, MAX_TOTAL_EXPOSURE 100); settled loss today ${(-(status.settledToday ?? 0)).toFixed(2)} > DAILY_LOSS_LIMIT 100`,
+        `${before.toFixed(2)} to ${after.toFixed(2)} (MAX_MARKET_LIABILITY 60, MAX_TOTAL_EXPOSURE 120); settled loss today ${(-(status.settledToday ?? 0)).toFixed(2)} > DAILY_LOSS_LIMIT 120`,
     );
   });
 

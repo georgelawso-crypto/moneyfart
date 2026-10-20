@@ -271,6 +271,32 @@ describe("risk guard: Australian in-play rule", () => {
   });
 });
 
+describe("risk guard: markets it doesn't model", () => {
+  test("each-way and handicap markets are refused, and orders are sent as the market's own runner", async () => {
+    const eachWay = new FakeBetfair();
+    eachWay.catalogues.get(WIN_MARKET)!.description!.marketType = "EACH_WAY";
+    const a = connector({}, eachWay).c;
+    assert.match((await a.exchange.placeOrders(WIN_MARKET, [order(101, "BACK", 3.0, 5)], TAG))[0].errorCode!, /^INVALID_ORDER: this is an each-way market/);
+    const handicap = new FakeBetfair();
+    handicap.catalogues.get(WIN_MARKET)!.description!.bettingType = "ASIAN_HANDICAP_DOUBLE_LINE";
+    const b = connector({}, handicap).c;
+    assert.match((await b.exchange.placeOrders(WIN_MARKET, [order(101, "BACK", 3.0, 5)], TAG))[0].errorCode!, /^INVALID_ORDER: this is a ASIAN_HANDICAP_DOUBLE_LINE market/);
+    // A near-zero handicap is the runner itself: sent with the runner's exact handicap.
+    const plain = new FakeBetfair();
+    const c = connector({}, plain).c;
+    assert.equal((await c.exchange.placeOrders(WIN_MARKET, [order(101, "BACK", 3.0, 5, { handicap: 1e-10 })], TAG))[0].status, "SUCCESS");
+    assert.deepEqual((await c.exchange.currentOrders([WIN_MARKET])).map((o) => o.selectionId), ["101"]);
+  });
+
+  test("a selection that isn't an active runner is refused", async () => {
+    const fake = new FakeBetfair();
+    const { c } = connector({}, fake);
+    assert.match((await c.exchange.placeOrders(WIN_MARKET, [order(999, "BACK", 3.0, 5)], TAG))[0].errorCode!, /^INVALID_ORDER: selection 999 is not a runner in this market/);
+    fake.setRunner(102, { status: "REMOVED" });
+    assert.match((await c.exchange.placeOrders(WIN_MARKET, [order(102, "BACK", 5.9, 5)], TAG))[0].errorCode!, /^INVALID_ORDER: selection 102 is not an active runner \(REMOVED\)/);
+  });
+});
+
 describe("risk guard: delayed data", () => {
   test("live mode refuses new risk on delayed prices but still lets a position be closed", async () => {
     const { c, fake } = connector({ TRADING_MODE: "live" });

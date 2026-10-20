@@ -288,7 +288,9 @@ export class Connector {
     if (this.riskChecking || !this.betfairConfigured || !this.state.ownsDataDir()) return;
     this.riskChecking = true;
     try {
-      if (this.guard.killSwitch()) {
+      const kill = this.guard.killSwitch();
+      if (kill?.unreadable) return; // may clear: nothing irreversible on an unreadable file
+      if (kill) {
         await this.stopBotsIfKilled();
         const report = await this.guard.cancelRiskAddingUnmatched();
         const done = report.cancelled.filter((c) => c.status === "SUCCESS").length;
@@ -316,9 +318,14 @@ export class Connector {
     }
   }
 
-  /** Stop every running bot once a kill switch is on (engaged here, in another process, or as a damaged file). */
+  /**
+   * Stop every running bot once a kill switch is on (engaged here, in another process, or as a
+   * damaged file). Not on a file that can't be read for a moment: that error may clear, and a stopped
+   * bot no longer manages its position (its new risk is refused meanwhile anyway).
+   */
   private async stopBotsIfKilled() {
-    if (!this.guard.killSwitch() || !this.bots.list({ status: "running" }).length) return;
+    const kill = this.guard.killSwitch();
+    if (!kill || kill.unreadable || !this.bots.list({ status: "running" }).length) return;
     const stopped = await this.bots.stopAll();
     console.error(`[risk] kill switch engaged: stopped ${stopped} bot(s).`);
   }
@@ -348,7 +355,8 @@ export class Connector {
     this.botTicking = true;
     try {
       // A kill switch engaged in another process: stop rather than tick (the guard already refuses their new risk).
-      if (this.guard.killSwitch()) await this.stopBotsIfKilled();
+      const kill = this.guard.killSwitch();
+      if (kill && !kill.unreadable) await this.stopBotsIfKilled();
       else await this.bots.tick();
     } catch (error) {
       console.error(`[bots] ${(error as Error).message}`);

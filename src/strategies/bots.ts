@@ -3,7 +3,7 @@ import { betSizeProblem, type CurrencyRules } from "../betfair/currency.js";
 import { ticksBetween, type LadderType } from "../betfair/ticks.js";
 import type { MarketBook, Runner, Side } from "../betfair/types.js";
 import type { Config } from "../config.js";
-import { PERMANENT_REFUSALS, guardRefusal } from "../exchange/guard.js";
+import { PERMANENT_REFUSALS, TRANSIENT_REFUSALS, guardRefusal } from "../exchange/guard.js";
 import { addBet, greenUpProfit, liability, positionOf, worstCase, type Position } from "../exchange/math.js";
 import type { CancelResult, Exchange, OrderView, StrategyTag } from "../exchange/types.js";
 import { formatSelectionId, marketStatusName, round, runnerStatusName, type SelectionRef } from "../format.js";
@@ -359,6 +359,9 @@ export class BotRunner {
     const placement = await this.placeTracked(bot, m, view, "entry", { ...ref, ...plan, role: "entry", selectionName: m.selectionName }, Boolean(book.inplay));
     if (placement.reason) return this.finish(bot, "failed", `${name}: ${placement.reason} Bet not placed.`);
     const bet = placement.bet!;
+    // A read that failed (the market, the account, the kill switch file): nothing was sent, so try again.
+    const refusal = bet.status === "FAILURE" ? guardRefusal(bet) : undefined;
+    if (refusal && TRANSIENT_REFUSALS.has(refusal)) return this.note(bot, `The entry was not sent (${bet.errorCode}); trying again on the next tick.`);
     if (bet.status === "UNKNOWN") {
       return this.finish(bot, "failed", `The entry bet's outcome is unknown (${bet.errorCode}); check get_current_orders. The bot does not manage it.`);
     }
@@ -640,6 +643,9 @@ export class BotRunner {
       m.refusedClose = refusal;
       if (PERMANENT_REFUSALS.has(refusal)) {
         return { done: "failed", message: `The closing bet ${order.side} @ ${order.price} was refused (${bet.errorCode}); the bot can't close the position, which stays open (${describePosition(position)}).` };
+      }
+      if (oneShot) {
+        return { message: `The closing bet ${order.side} @ ${order.price} was refused by the risk guard (${bet.errorCode}); the bot is stopped, so it won't try again: close the position with Close Selection Bet Position or on Betfair.` };
       }
       return { message: `The closing bet ${order.side} @ ${order.price} was refused by the risk guard; trying again on the next tick. ${bet.errorCode}` };
     }
