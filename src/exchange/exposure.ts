@@ -12,7 +12,7 @@
 // markets, every selection counts on its own (the sum of their worst cases, an upper bound).
 
 import type { Side } from "../betfair/types.js";
-import { betOutcomeProfit } from "./math.js";
+import { addBet, betOutcomeProfit, worstCase, type Position } from "./math.js";
 
 export interface Leg {
   /** Formatted selection id. */
@@ -53,6 +53,48 @@ export function legProfit(leg: Leg, wins: boolean, remainder: Remainder): number
     if (leg.spLiability && leg.spLiability > 0 && (leg.side === "BACK" ? !wins : wins)) profit -= leg.spLiability;
   }
   return profit;
+}
+
+/** Losses of one winner set: uncertain parts counted where they lose (hurt) and where they win (help). */
+export interface Scenario {
+  winners: Set<string>;
+  /** Highest possible loss in this outcome, whichever uncertain bets match. */
+  hurt: number;
+  /** Lowest possible loss in this outcome, whichever uncertain bets match. */
+  help: number;
+}
+
+/**
+ * Every outcome of the market (winner sets among the selections with bets, plus `extra`), with the
+ * highest and lowest loss each can bring. Undefined when the outcomes can't be enumerated, or when
+ * an unmatched SP bet is involved (its winnings, and so the lowest loss, are unknown before the off).
+ */
+export function scenarioLosses(legs: Leg[], shape: MarketShape, extra: string[] = []): Scenario[] | undefined {
+  const removed = new Set(shape.removed ?? []);
+  const live = legs.filter((l) => !removed.has(l.key));
+  if (live.some((l) => (l.spLiability ?? 0) > 0)) return undefined;
+  const keys = [...new Set([...live.map((l) => l.key), ...extra.filter((k) => !removed.has(k))])];
+  const sets = winnerSets(keys, shape);
+  if (!sets) return undefined;
+  return sets.map((winners) => {
+    let hurt = 0;
+    let help = 0;
+    for (const leg of live) {
+      const wins = winners.has(leg.key);
+      let matched = 0;
+      for (const f of leg.fills) matched += betOutcomeProfit(leg.side, f.price, f.size, wins);
+      const rest = leg.remaining > 0 && leg.price >= 1.01 ? betOutcomeProfit(leg.side, leg.price, leg.remaining, wins) : 0;
+      hurt -= matched + Math.min(0, rest);
+      help -= matched + Math.max(0, rest);
+    }
+    return { winners, hurt, help };
+  });
+}
+
+/** True when the outcomes of a market with bets on these selections are enumerated exactly. */
+export function enumerable(keys: string[], shape: MarketShape): boolean {
+  const removed = new Set(shape.removed ?? []);
+  return winnerSets([...new Set(keys.filter((k) => !removed.has(k)))], shape) !== undefined;
 }
 
 /** Winner sets to evaluate, or undefined to fall back to counting selections independently. */
@@ -116,4 +158,73 @@ export function asMatched(leg: Leg): Leg {
 /** Most a leg can lose on its own: a back's stake, a lay's liability, an SP bet's liability. */
 export function legLiability(leg: Leg): number {
   return Math.max(0, -Math.min(legProfit(leg, true, "hurt"), legProfit(leg, false, "hurt")));
+}
+
+// ------------------------------------------------------------------ closing rule
+
+/** Whether a request only closes a position; `why` says why one on the closing side still isn't counted. */
+export type Closing = { closing: true } | { closing: false; why?: string };
+
+const CLOSING_EPS = 1e-6;
+
+function matchedPosition(legs: Leg[], key: string): Position {
+  let position: Position = { ifWin: 0, ifLose: 0 };
+  for (const l of legs) if (l.key === key) for (const f of l.fills) position = addBet(position, l.side, f.price, f.size);
+  return position;
+}
+
+/**
+ * A request (new legs, nothing matched) is closing when:
+ *  1. its bets are on one selection, on the side that reduces that selection's matched position;
+ *  2. with every bet already resting (or possibly placed) on that side matched too, they don't take
+ *     the selection past flat;
+ *  3. however much of it matches, and whatever the market's other unmatched or possibly-placed bets
+ *     do, the market's worst case can't rise: the highest loss in the outcomes where these bets lose,
+ *     plus what they lose there, stays within the lowest possible loss of the worst other outcome.
+ * With an unmatched SP bet in the market (price unknown), or outcomes that can't be enumerated while
+ * other selections have bets, nothing counts as closing. `known` is every other bet in the market.
+ */
+export function closingVerdict(known: Leg[], shape: MarketShape, legs: Leg[]): Closing {
+  const key = legs[0]?.key;
+  const side = legs[0]?.side;
+  if (!key || legs.some((l) => l.key !== key || l.side !== side)) return { closing: false };
+  const removed = new Set(shape.removed ?? []);
+  if (removed.has(key)) return { closing: false };
+  const live = known.filter((l) => !removed.has(l.key));
+
+  // 1. A matched position, and the side that reduces it.
+  let position = matchedPosition(live, key);
+  const diff = position.ifWin - position.ifLose;
+  if (Math.abs(diff) < 0.01) return { closing: false };
+  const closingSide: Side = diff > 0 ? "LAY" : "BACK";
+  if (side !== closingSide) return { closing: false };
+  if (live.some((l) => (l.spLiability ?? 0) > 0)) return { closing: false, why: "an unmatched Betfair SP bet in this market has a price nobody knows until the off" };
+
+  // 2. Not past flat, counting the bets already resting on the same side.
+  for (const l of live) if (l.key === key && l.side === side && l.remaining > 0) position = addBet(position, l.side, l.price, l.remaining);
+  let after = position;
+  for (const l of legs) after = addBet(after, l.side, l.price, l.remaining);
+  if (worstCase(after) < worstCase(position) - CLOSING_EPS) {
+    return { closing: false, why: "with the bets already resting on the same side it would close more than the whole position" };
+  }
+
+  // 3. The market's worst case, however much of everything uncertain matches.
+  const scenarios = scenarioLosses(live, shape, [key]);
+  if (!scenarios) {
+    if (live.every((l) => l.key === key)) return { closing: true }; // the market is this selection: 2 decides exactly
+    return { closing: false, why: "this market's outcomes can't be worked out exactly while other selections have bets" };
+  }
+  const loses = legs.reduce((total, l) => total + (l.side === "BACK" ? l.remaining : l.remaining * (l.price - 1)), 0);
+  let badHigh = Number.NEGATIVE_INFINITY;
+  let goodLow = Number.NEGATIVE_INFINITY;
+  for (const s of scenarios) {
+    const legsLose = side === "BACK" ? !s.winners.has(key) : s.winners.has(key);
+    if (legsLose) badHigh = Math.max(badHigh, s.hurt);
+    else goodLow = Math.max(goodLow, s.help);
+  }
+  if (badHigh === Number.NEGATIVE_INFINITY || badHigh + loses <= goodLow + CLOSING_EPS) return { closing: true };
+  return {
+    closing: false,
+    why: "on its own it could raise the market's worst case (for example lays on two runners that cover each other, or unmatched bets on other runners that this position covers)",
+  };
 }

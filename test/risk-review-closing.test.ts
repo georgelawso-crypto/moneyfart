@@ -36,17 +36,35 @@ async function quietly<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 describe("review: closing bets refused as new risk", () => {
-  test("kill switch on: Close Market Bet Position cannot close lays on two runners", async () => {
+  test("kill switch on: lays on two runners that cover each other can't be closed (a partly matched close would raise the worst case)", async () => {
+    // Updated after the second review: closing both together only lowers the worst case if both
+    // match in full; with one partly matched it rises (16 -> 21.27 in review2-partial-close), so
+    // neither hedge counts as closing and the kill switch refuses them, saying why.
     const { c } = connector();
     // Lay 101 10 @ 3.05 (liability 20.50) and lay 102 5 @ 6.2 (liability 26): worst case 16 (102 wins).
     assert.equal((await c.exchange.placeOrders(WIN_MARKET, [order(101, "LAY", 3.05, 10)], TAG))[0].sizeMatched, 10);
     assert.equal((await c.exchange.placeOrders(WIN_MARKET, [order(102, "LAY", 6.2, 5)], TAG))[0].sizeMatched, 5);
     const report = await c.engageKillSwitch("something looks wrong");
-    assert.match(report.notes.join(" "), /Bets that close them still go through: Close Market Bet Position/);
+    assert.match(report.notes.join(" "), /lays on two runners that cover each other\) is refused while the kill switch is on: close those on Betfair/);
 
     const result = await c.executeStrategy("Close Market Bet Position", WIN_MARKET, []);
-    const refused = result.bets.filter((b) => b.status !== "SUCCESS").map((b) => `${b.side} ${b.selectionId} ${b.size}@${b.price}: ${b.errorCode}`);
-    assert.equal(result.status, true, `the positions could not be closed under the kill switch:\n${refused.join("\n")}`);
+    assert.equal(result.status, false);
+    assert.equal(result.bets.length, 2);
+    for (const bet of result.bets) {
+      assert.match(bet.errorCode!, /^KILL_SWITCH_ENGAGED: .*it isn't counted as a closing bet: on its own it could raise the market's worst case \(for example lays on two runners that cover each other/);
+    }
+    assert.equal((await c.exchange.currentOrders([WIN_MARKET])).length, 2, "only the two lays");
+  });
+
+  test("kill switch on: Close Market Bet Position closes positions that don't cover each other, one selection at a time", async () => {
+    const { c } = connector();
+    // Back 101 10 @ 3.0 and back 102 5 @ 5.9: each green-up lowers the worst case on its own.
+    assert.equal((await c.exchange.placeOrders(WIN_MARKET, [order(101, "BACK", 3.0, 10)], TAG))[0].sizeMatched, 10);
+    assert.equal((await c.exchange.placeOrders(WIN_MARKET, [order(102, "BACK", 5.9, 5)], TAG))[0].sizeMatched, 5);
+    await c.engageKillSwitch("flatten everything");
+    const result = await c.executeStrategy("Close Market Bet Position", WIN_MARKET, []);
+    assert.equal(result.status, true, JSON.stringify(result.bets));
+    assert.deepEqual(result.bets.map((b) => [b.selectionId, b.side, b.status]), [["101", "LAY", "SUCCESS"], ["102", "LAY", "SUCCESS"]]);
   });
 
   test("a Lay Trade bot whose green-up is refused stops managing its position after 5 ticks", async () => {

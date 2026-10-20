@@ -3,7 +3,7 @@ import { betSizeProblem, type CurrencyRules } from "../betfair/currency.js";
 import { ticksBetween, type LadderType } from "../betfair/ticks.js";
 import type { MarketBook, Runner, Side } from "../betfair/types.js";
 import type { Config } from "../config.js";
-import { guardRefusal } from "../exchange/guard.js";
+import { PERMANENT_REFUSALS, guardRefusal } from "../exchange/guard.js";
 import { addBet, greenUpProfit, liability, positionOf, worstCase, type Position } from "../exchange/math.js";
 import type { CancelResult, Exchange, OrderView, StrategyTag } from "../exchange/types.js";
 import { formatSelectionId, marketStatusName, round, runnerStatusName, type SelectionRef } from "../format.js";
@@ -66,6 +66,8 @@ export interface BotMeta {
   hadPosition?: boolean;
   failures: number;
   lastNote?: string;
+  /** The risk guard refused the latest closing bet (its code); cleared once a closing bet is placed. */
+  refusedClose?: string;
   /**
    * Orders sent but not yet recorded: saved before the request so that after a restart (or a request
    * that threw) the bot finds the bet by customerOrderRef instead of placing it again.
@@ -293,7 +295,10 @@ export class BotRunner {
     if (bot.status !== "running") return;
     const book = view.book;
     if (!book) return this.finish(bot, "finished", "The market is no longer available from Betfair (closed or purged); bot finished.");
-    if (book.status === "CLOSED") return this.finish(bot, "finished", "Market closed; bot finished.");
+    if (book.status === "CLOSED") {
+      if (m.refusedClose) return this.finish(bot, "failed", `The market closed before the bot could close its position: its closing bet was refused (${m.refusedClose}).`);
+      return this.finish(bot, "finished", "Market closed; bot finished.");
+    }
     const runner = runnerOf(book, bot);
     if (!runner) return this.finish(bot, "finished", "The selection is no longer in the market; bot finished.");
     if (runner.status !== "ACTIVE") {
@@ -628,11 +633,15 @@ export class BotRunner {
     );
     if (placement.reason) throw new Error(`Closing bet not sent: ${placement.reason}`);
     const bet = placement.bet!;
-    // A refusal by the risk guard can clear (a read that failed, another position closed, the next
-    // day): keep managing the position and try again, rather than counting it as the bot failing.
-    const refusedBy = bet.status === "FAILURE" ? guardRefusal(bet.errorCode) : undefined;
-    if (refusedBy) {
-      return { message: `The closing bet ${order.side} @ ${order.price} was refused by the risk guard (${refusedBy}); trying again on the next tick. ${bet.errorCode}` };
+    // A refusal by the risk guard usually clears (a read that failed, another position closed): keep
+    // managing the position and try again. One that can't clear while the market lasts ends the bot.
+    const refusal = bet.status === "FAILURE" ? guardRefusal(bet) : undefined;
+    if (refusal) {
+      m.refusedClose = refusal;
+      if (PERMANENT_REFUSALS.has(refusal)) {
+        return { done: "failed", message: `The closing bet ${order.side} @ ${order.price} was refused (${bet.errorCode}); the bot can't close the position, which stays open (${describePosition(position)}).` };
+      }
+      return { message: `The closing bet ${order.side} @ ${order.price} was refused by the risk guard; trying again on the next tick. ${bet.errorCode}` };
     }
     if (bet.status === "UNKNOWN") {
       return {
@@ -644,6 +653,7 @@ export class BotRunner {
     bot.betIds.push(bet.betId);
     m.closeBetIds.push(bet.betId);
     m.lastCloseAt = now;
+    m.refusedClose = undefined;
     this.log(bot, `Placed closing ${bet.side} ${bet.size} @ ${bet.price} (bet ${bet.betId}, matched ${round(bet.sizeMatched ?? 0)}).`);
     if (bet.warning) this.note(bot, bet.warning);
     const matched = bet.sizeMatched ?? 0;

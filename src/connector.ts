@@ -264,27 +264,39 @@ export class Connector {
         const report = await this.guard.cancelAllUnmatched();
         cancelled = report.cancelled;
         if (report.failures.length) notes.push(`Some unmatched bets could not be cancelled (${report.failures.join("; ")}): check get_current_orders and cancel them with cancel_bets.`);
+        if (report.uncancellable.length) {
+          notes.push(`Betfair's API can't cancel Betfair SP bets, so these are still waiting for the off: ${report.uncancellable.join("; ")}. Check them on Betfair.`);
+        }
       } catch (error) {
         notes.push(`Could not read the unmatched bets to cancel them (${(error as Error).message}): check get_current_orders and cancel them with cancel_bets.`);
       }
     }
     notes.push(
-      "Matched positions are still open. Bets that close them still go through: Close Market Bet Position (or Close Selection Bet Position), or close them on Betfair. Closing one selection on its own is refused when it would raise the market's worst case; close the whole market instead.",
+      "Matched positions are still open. Bets that close them still go through: Close Market Bet Position or Close Selection Bet Position. " +
+        "A close that could raise the market's worst case on its own (lays on two runners that cover each other) is refused while the kill switch is on: close those on Betfair.",
     );
     return { killSwitch, release: this.guard.killSwitchReleaseHint(), botsStopped, cancelled, notes };
   }
 
   /**
-   * Run by the process that owns DATA_DIR every 30 s: stops bots after a kill switch engaged
-   * elsewhere, and once today's settled losses reach DAILY_LOSS_LIMIT cancels the unmatched bets
-   * that would add risk (resting closing bets stay so positions can still be closed). A day counts
-   * as handled only once every cancel has gone through.
+   * Run by the process that owns DATA_DIR every 30 s. While the kill switch is on it stops bots and
+   * cancels unmatched bets that would add risk (one that turns up late, after a timeout). Once
+   * today's settled losses reach DAILY_LOSS_LIMIT it cancels those too; resting closing bets stay so
+   * positions can still be closed. A day counts as handled only once every cancel has gone through.
    */
   async riskCheck() {
     if (this.riskChecking || !this.betfairConfigured || !this.state.ownsDataDir()) return;
     this.riskChecking = true;
     try {
-      await this.stopBotsIfKilled();
+      if (this.guard.killSwitch()) {
+        await this.stopBotsIfKilled();
+        const report = await this.guard.cancelRiskAddingUnmatched();
+        const done = report.cancelled.filter((c) => c.status === "SUCCESS").length;
+        if (done || report.failures.length) {
+          console.error(`[risk] kill switch engaged: cancelled ${done} unmatched bet(s) that would add risk${report.failures.length ? `; failed: ${report.failures.join("; ")}` : ""}.`);
+        }
+        return;
+      }
       const day = startOfDay(Date.now(), this.config.output.displayTimeZone);
       if (this.dailyLimitHandled === day) return;
       // Only unmatched bets need acting on: while there are none, one cheap read is enough.

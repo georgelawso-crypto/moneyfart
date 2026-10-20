@@ -12,26 +12,24 @@
 //   - live mode:   nothing but closing bets on delayed market data
 //   - Australia:   no bets at all on in-play sport (Betfair only takes those by phone)
 //
-// Closing bets skip those checks. A set of bets sent together counts as closing when every one
-// reduces its own selection's matched position (worst case no lower; resting bets on the same
-// side, and orders whose outcome is unknown, counted as matched so closes cannot add up to an
-// over-hedge) and, with all of them matched, the market's matched worst case is no higher than
-// now. Everything else is checked as new risk, and a request is all or nothing: one refused bet
-// refuses every bet in it, so a dutch is never left half placed.
+// A request is closing, and skips those checks, when it is bets on one selection on the side that
+// reduces its matched position, without going past flat, and however much of it matches and
+// whatever happens to the market's other unmatched or possibly-placed bets, the market's worst case
+// can't rise. Everything else is new risk, checked against every limit, all or nothing.
 //
-// The guard fails closed: when it cannot read the market, the account or today's results it
-// refuses (callers retry), and a kill switch it cannot save to disk still holds in this process.
+// The guard fails closed: when it can't read the market, the account or today's results it refuses
+// (callers retry), and a kill switch it can't save to disk still holds in this process.
 
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { CurrencyRules } from "../betfair/currency.js";
-import type { MarketBook, MarketCatalogue, Side } from "../betfair/types.js";
+import type { MarketBook, MarketCatalogue } from "../betfair/types.js";
 import type { Config, Jurisdiction } from "../config.js";
-import { formatSelectionId, round } from "../format.js";
+import { assertMarketId, formatSelectionId, round } from "../format.js";
 import type { MarketService } from "../markets.js";
-import { asMatched, legLiability, matchedPart, worstLoss, type Leg, type MarketShape } from "./exposure.js";
-import { addBet, liability, worstCase, type Position } from "./math.js";
+import { closingVerdict, enumerable, legLiability, worstLoss, type Closing, type Leg, type MarketShape } from "./exposure.js";
+import { liability } from "./math.js";
 import type { CancelResult, Exchange, FundsView, OrderRequest, OrderView, PlacedBet, SettledBets, StrategyTag } from "./types.js";
 
 export type RiskLimits = Pick<Config["trading"], "maxStake" | "maxLiability" | "maxMarketLiability" | "maxTotalExposure" | "dailyLossLimit">;
@@ -75,32 +73,20 @@ export interface RiskStatus {
   error?: string;
 }
 
-/** Cancels made by a clean-up, and the markets where cancelling failed. */
+/** Cancels made by a clean-up, the markets where cancelling failed, and bets the API can't cancel. */
 export interface CancelReport {
   cancelled: CancelResult[];
   failures: string[];
+  /** Unmatched Betfair SP bets: the API only cancels LIMIT orders. */
+  uncancellable: string[];
 }
 
-/** errorCode prefixes the guard uses when it refuses a bet. */
-export const GUARD_CODES = [
-  "INVALID_ORDER",
-  "IN_PLAY_SPORT_NOT_ALLOWED",
-  "RISK_CHECK_FAILED",
-  "KILL_SWITCH_ENGAGED",
-  "READ_ONLY_PROCESS",
-  "DELAYED_DATA",
-  "MAX_STAKE",
-  "MAX_LIABILITY",
-  "MAX_MARKET_LIABILITY",
-  "MAX_TOTAL_EXPOSURE",
-  "DAILY_LOSS_LIMIT",
-  "BATCH_REFUSED",
-] as const;
+/** Refusals that will not clear while the market lasts (a bot stops retrying them). */
+export const PERMANENT_REFUSALS = new Set(["IN_PLAY_SPORT_NOT_ALLOWED", "INVALID_ORDER"]);
 
-/** The guard's refusal code of a bet's errorCode, or undefined when the guard did not refuse it. */
-export function guardRefusal(errorCode?: string): string | undefined {
-  const code = errorCode?.split(":")[0]?.trim();
-  return code && (GUARD_CODES as readonly string[]).includes(code) ? code : undefined;
+/** The guard's refusal code of a bet it refused, or undefined (Betfair's own codes are never read as one). */
+export function guardRefusal(bet: Pick<PlacedBet, "refusedBy" | "errorCode">): string | undefined {
+  return bet.refusedBy === "risk-guard" ? (bet.errorCode?.split(":")[0]?.trim() ?? "REFUSED") : undefined;
 }
 
 /** Betfair event types that Australian customers may bet on in-play online (racing, not sport). */
@@ -109,7 +95,6 @@ const RACING_EVENT_TYPES = new Set(["7", "4339"]);
 const EPS = 1e-6;
 /** An UNKNOWN order (timed out, not found yet) counts as possibly placed for this long unless it shows up among the current orders. */
 const UNCONFIRMED_MS = 10 * 60_000;
-const FLAGGED_NOTE = " (It was sent as a closing bet, but it doesn't close a position, so it was checked as a new bet.)";
 
 const keyOf = (order: { selectionId: number; handicap: number }) => formatSelectionId(order.selectionId, order.handicap ?? 0);
 const money = (value: number) => (round(value, 2) ?? 0).toFixed(2);
@@ -117,33 +102,35 @@ const money = (value: number) => (round(value, 2) ?? 0).toFixed(2);
 /** An order view as legs see it: one fill at the average matched price, the unmatched remainder, an unmatched SP bet. */
 function legOfView(o: OrderView): Leg {
   const fills = o.sizeMatched > 0 && o.averagePriceMatched ? [{ price: o.averagePriceMatched, size: o.sizeMatched }] : [];
-  const sp = !fills.length && o.status === "EXECUTABLE" && (o.bspLiability ?? 0) > 0 ? o.bspLiability : undefined;
+  const sp = o.status === "EXECUTABLE" && o.sizeRemaining <= 0 && (o.bspLiability ?? 0) > 0 ? o.bspLiability : undefined;
   return { key: o.selectionId, side: o.side, price: o.price, remaining: o.sizeRemaining, fills, spLiability: sp };
 }
 
-/** A new order as a leg: nothing matched yet (it may all match). */
+/** A new order as a leg: nothing matched yet (it may all match, or any part of it). */
 function legOfOrder(o: OrderRequest): Leg {
   return { key: keyOf(o), side: o.side, price: o.price, remaining: o.size, fills: [] };
 }
 
 function refused(order: OrderRequest, errorCode: string): PlacedBet {
-  return { selectionId: keyOf(order), side: order.side, price: order.price, size: order.size, status: "FAILURE", errorCode };
+  return { selectionId: keyOf(order), side: order.side, price: order.price, size: order.size, status: "FAILURE", errorCode, refusedBy: "risk-guard" };
 }
 
-/** Why an order cannot even be assessed (NaN, out-of-range price, non-positive size). */
+/** Prices and stakes in whole cents, as every exchange sends them (checked as sent). */
+function normalised(o: OrderRequest): OrderRequest {
+  return { ...o, price: round(o.price, 2) ?? Number.NaN, size: round(o.size, 2) ?? Number.NaN };
+}
+
+/** Why an order cannot even be assessed (NaN, out-of-range price, stake under a cent). */
 function invalidOrder(o: OrderRequest): string | undefined {
   if (o.side !== "BACK" && o.side !== "LAY") return `side must be BACK or LAY, got ${String(o.side)}`;
   if (!Number.isInteger(o.selectionId) || !Number.isFinite(o.handicap ?? 0)) return "the selection is not valid";
   if (!Number.isFinite(o.price) || o.price < 1.01 || o.price > 1000) return `price ${o.price} is not a Betfair price (1.01 to 1000)`;
-  if (!Number.isFinite(o.size) || o.size <= 0) return `size ${o.size} is not a positive amount`;
+  if (!Number.isFinite(o.size) || o.size < 0.01) return `size ${o.size} is not a positive amount`;
   return undefined;
 }
 
-function matchedPosition(legs: Leg[], key: string): Position {
-  let position: Position = { ifWin: 0, ifLose: 0 };
-  for (const l of legs) if (l.key === key) for (const f of l.fills) position = addBet(position, l.side, f.price, f.size);
-  return position;
-}
+/** A leg reduced to its matched part (cancelled, or judged as the request itself). */
+const matchedOnly = (leg: Leg): Leg => ({ ...leg, remaining: 0, spLiability: undefined });
 
 // ------------------------------------------------------------------ day boundary
 
@@ -179,10 +166,12 @@ export function startOfDay(now: number, timeZone: string): number {
 
 // ------------------------------------------------------------------ kill switch
 
+type FileRead = { state: KillSwitchState } | { absent: true } | { broken: string };
+
 /**
  * Kill switch flag. With DATA_DIR it is a file every process sharing DATA_DIR reads, and deleting
- * the file releases it. It is set in memory first, so a disk error can't leave it off here: then it
- * holds in this process until it restarts.
+ * the file releases it. Engaging sets it in memory before writing the file, so a disk error can't
+ * leave it off here: then it holds in this process until it restarts.
  */
 class KillSwitchStore {
   private memory?: KillSwitchState;
@@ -191,31 +180,40 @@ class KillSwitchStore {
 
   constructor(readonly file?: string) {}
 
-  get(): KillSwitchState | undefined {
-    if (!this.file || this.memoryOnly) return this.memory;
+  private read(): FileRead {
     let text: string;
     try {
-      text = fs.readFileSync(this.file, "utf8");
+      text = fs.readFileSync(this.file!, "utf8");
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-        this.memory = undefined; // released by deleting the file
-        return undefined;
-      }
-      return { engagedAt: "", reason: `the kill switch file could not be read (${(error as Error).message}), so it counts as engaged` };
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return { absent: true };
+      return { broken: `the kill switch file could not be read (${(error as Error).message}), so it counts as engaged` };
     }
     try {
       const parsed = JSON.parse(text) as Partial<KillSwitchState>;
-      return { engagedAt: String(parsed.engagedAt ?? ""), reason: String(parsed.reason ?? "engaged") };
+      if (!parsed || typeof parsed !== "object") throw new Error("not an object");
+      return { state: { engagedAt: String(parsed.engagedAt ?? ""), reason: String(parsed.reason ?? "engaged") } };
     } catch {
-      return { engagedAt: "", reason: "the kill switch file is damaged, so it counts as engaged" };
+      return { broken: "the kill switch file is damaged, so it counts as engaged" };
     }
   }
 
+  get(): KillSwitchState | undefined {
+    if (!this.file || this.memoryOnly) return this.memory;
+    const read = this.read();
+    if ("absent" in read) {
+      this.memory = undefined; // released by deleting the file
+      return undefined;
+    }
+    return "state" in read ? read.state : { engagedAt: "", reason: read.broken };
+  }
+
   engage(state: KillSwitchState): KillSwitchState & { fileError?: string } {
-    const current = this.get();
-    if (current) return current; // keep the first reason and time
+    if (!this.file) return (this.memory ??= state);
+    if (this.memoryOnly) return this.memory!;
+    const read = this.read();
+    if ("state" in read) return read.state; // engaged already: keep the first reason and time
+    // Absent, unreadable or damaged: engage now, in memory first, then in the file.
     this.memory = state;
-    if (!this.file) return state;
     const tmp = `${this.file}.${crypto.randomUUID()}.tmp`;
     try {
       fs.mkdirSync(path.dirname(this.file), { recursive: true });
@@ -237,7 +235,9 @@ class KillSwitchStore {
   /** How the account holder releases it (deliberately not something a tool can do). */
   releaseHint(): string {
     if (this.file && !this.memoryOnly) return `delete ${this.file}`;
-    return this.file ? "restart the connector (the kill switch file could not be written, so it holds in this process until it restarts)" : "restart the connector (without DATA_DIR the kill switch lives in memory)";
+    return this.file
+      ? "restart the connector (the kill switch file could not be written, so it holds in this process until it restarts)"
+      : "restart the connector (without DATA_DIR the kill switch lives in memory)";
   }
 }
 
@@ -246,7 +246,9 @@ class KillSwitchStore {
 interface MarketRisk {
   book: MarketBook;
   catalogue?: MarketCatalogue;
-  /** The market's orders as Betfair (or the paper ledger) reports them. */
+  /** The market's orders as the exchange reports them. */
+  views: OrderView[];
+  /** Those orders as legs (same order as views). */
   legs: Leg[];
   /** Orders sent earlier whose outcome is unknown: they may exist. */
   phantoms: Leg[];
@@ -264,9 +266,9 @@ interface AccountRisk {
 interface Verdict {
   /** Per-order refusal, or undefined for orders that may be sent. */
   problems: Array<string | undefined>;
-  /** The request adds risk (checked) rather than only closing positions. */
+  /** The request adds risk (checked) rather than only closing a position. */
   addsRisk: boolean;
-  /** Exposure reserved at account level until the request has been placed. */
+  /** Exposure reserved at account level until the request has landed. */
   reservation?: number;
 }
 
@@ -276,9 +278,9 @@ export class GuardedExchange implements Exchange {
   private readonly killSwitchStore: KillSwitchStore;
   /** One placement at a time per market. */
   private readonly marketQueues = new Map<string, Promise<unknown>>();
-  /** Account-level checks one at a time, with the exposure of requests in flight reserved. */
+  /** Account-level checks one at a time, with the exposure of requests still on their way reserved. */
   private accountQueue: Promise<unknown> = Promise.resolve();
-  private readonly reservations = new Map<number, number>();
+  private readonly reservations = new Map<number, { amount: number; landed: boolean }>();
   private nextReservation = 0;
   /** Orders whose outcome came back UNKNOWN: counted as possibly placed until found or expired. */
   private unconfirmed: Array<{ marketId: string; leg: Leg; ref?: string; until: number }> = [];
@@ -341,12 +343,18 @@ export class GuardedExchange implements Exchange {
 
   /** One placement at a time per market (a slow in-play placement on one market doesn't hold up another). */
   placeOrders(marketId: string, orders: OrderRequest[], strategy: StrategyTag): Promise<PlacedBet[]> {
-    const run = () => this.guardedPlace(marketId, orders, strategy);
-    const next = (this.marketQueues.get(marketId) ?? Promise.resolve()).then(run, run);
+    let id: string;
+    try {
+      id = assertMarketId(marketId);
+    } catch (error) {
+      return Promise.resolve(orders.map((order) => refused(order, `INVALID_ORDER: ${(error as Error).message}`)));
+    }
+    const run = () => this.guardedPlace(id, orders.map(normalised), strategy);
+    const next = (this.marketQueues.get(id) ?? Promise.resolve()).then(run, run);
     const tail = next.catch(() => undefined);
-    this.marketQueues.set(marketId, tail);
+    this.marketQueues.set(id, tail);
     void tail.then(() => {
-      if (this.marketQueues.get(marketId) === tail) this.marketQueues.delete(marketId);
+      if (this.marketQueues.get(id) === tail) this.marketQueues.delete(id);
     });
     return next;
   }
@@ -357,9 +365,18 @@ export class GuardedExchange implements Exchange {
     return next;
   }
 
+  /** Why a request that adds risk can't be sent at all right now (kill switch, read-only process), or undefined. */
+  private blockedNow(): string | undefined {
+    const kill = this.killSwitch();
+    if (kill) {
+      return `KILL_SWITCH_ENGAGED: no new risk${kill.engagedAt ? ` since ${kill.engagedAt}` : ""} (${kill.reason}). Bets that close a position still go through. Only the account holder can release it: ${this.killSwitchReleaseHint()}.`;
+    }
+    const blocked = this.options.addRiskBlocked?.();
+    return blocked ? `READ_ONLY_PROCESS: ${blocked}` : undefined;
+  }
+
   private async guardedPlace(marketId: string, orders: OrderRequest[], strategy: StrategyTag): Promise<PlacedBet[]> {
     if (!orders.length) return [];
-    const killAtCheck = this.killSwitch();
     const invalid = orders.map(invalidOrder);
 
     let market: MarketRisk;
@@ -381,38 +398,54 @@ export class GuardedExchange implements Exchange {
       verdict = { problems: orders.map(() => reason), addsRisk: false };
     } else if (invalid.some(Boolean)) {
       verdict = {
-        problems: orders.map((order, i) =>
-          invalid[i] ? `INVALID_ORDER: ${invalid[i]}` : `BATCH_REFUSED: not sent because another bet in the same request is not a valid order; bets sent together go all or nothing.`,
+        problems: orders.map((_, i) =>
+          invalid[i] ? `INVALID_ORDER: ${invalid[i]}` : "BATCH_REFUSED: not sent because another bet in the same request is not a valid order; bets sent together go all or nothing.",
         ),
         addsRisk: true,
       };
     } else {
-      verdict = await this.assess(market, orders, killAtCheck);
+      verdict = await this.assess(market, orders);
     }
 
     const results: Array<PlacedBet | undefined> = verdict.problems.map((problem, i) => (problem ? refused(orders[i], problem) : undefined));
     const send = orders.map((_, i) => i).filter((i) => !verdict.problems[i]);
-    if (!send.length) return results as PlacedBet[];
+    const release = () => {
+      if (verdict.reservation !== undefined) this.reservations.delete(verdict.reservation);
+    };
+    if (!send.length) {
+      release();
+      return results as PlacedBet[];
+    }
+    // Checked again just before sending (nothing awaits in between): a kill switch engaged, or the
+    // DATA_DIR lock lost, while this request waited for its checks stops it here.
+    const blocked = verdict.addsRisk ? this.blockedNow() : undefined;
+    if (blocked) {
+      release();
+      return orders.map((order) => refused(order, blocked));
+    }
 
     const delayedPaper =
       this.mode === "paper" && market.book.isMarketDataDelayed
         ? "Delayed data: Betfair is sending this market's prices late (up to 3 minutes on a delayed app key) and without traded volume, so this paper result doesn't show what a live bet would have done."
         : undefined;
-    const batch = send.map((i) => orders[i]);
     let placed: PlacedBet[];
     try {
-      placed = await this.inner.placeOrders(marketId, batch, strategy);
-    } finally {
-      if (verdict.reservation !== undefined) this.reservations.delete(verdict.reservation);
+      placed = await this.inner.placeOrders(marketId, send.map((i) => orders[i]), strategy);
+    } catch (error) {
+      release(); // nothing was placed
+      throw error;
     }
+    // Landed: the next account read includes it, so the reservation goes at the start of that read.
+    const reservation = verdict.reservation !== undefined ? this.reservations.get(verdict.reservation) : undefined;
+    if (reservation) reservation.landed = true;
 
     // A kill switch engaged while this request was on its way: take back what it left resting.
-    const cancelNote = verdict.addsRisk && !killAtCheck && this.killSwitch() ? await this.cancelLanded(marketId, placed) : undefined;
+    const cancelNotes = verdict.addsRisk && this.killSwitch() ? await this.cancelLanded(marketId, placed) : undefined;
 
     send.forEach((i, k) => {
       const bet = placed[k];
       if (!bet) return;
-      const warning = [delayedPaper, cancelNote && bet.betId && cancelNote.has(bet.betId) ? cancelNote.get(bet.betId) : undefined].filter(Boolean).join(" ");
+      const warning = [delayedPaper, bet.betId ? cancelNotes?.get(bet.betId) : undefined].filter(Boolean).join(" ");
       results[i] = warning ? { ...bet, warning } : bet;
       if (bet.status === "UNKNOWN") {
         this.unconfirmed.push({ marketId, leg: legOfOrder(orders[i]), ref: bet.customerOrderRef ?? orders[i].customerOrderRef, until: this.now() + UNCONFIRMED_MS });
@@ -456,22 +489,22 @@ export class GuardedExchange implements Exchange {
     return notes;
   }
 
-  /** Closing bets pass; anything else is checked as new risk, all or nothing. */
-  private async assess(market: MarketRisk, orders: OrderRequest[], kill?: KillSwitchState): Promise<Verdict> {
+  /** Closing requests pass; anything else is checked as new risk, all or nothing. */
+  private async assess(market: MarketRisk, orders: OrderRequest[]): Promise<Verdict> {
     const legs = orders.map(legOfOrder);
-    if (this.closes(market, legs)) return { problems: orders.map(() => undefined), addsRisk: false };
+    const closing = this.closes(market, legs);
+    if (closing.closing) return { problems: orders.map(() => undefined), addsRisk: false };
 
-    const flagged = (i: number) => (orders[i].reducesRisk ? FLAGGED_NOTE : "");
-    const all = (problem: string): Verdict => ({ problems: orders.map((_, i) => problem + flagged(i)), addsRisk: true });
+    const note = closing.why
+      ? ` (It reduces the position on its selection, but it isn't counted as a closing bet: ${closing.why}.)`
+      : orders.some((o) => o.reducesRisk)
+        ? " (It was sent as a closing bet, but it doesn't reduce a matched position on its selection, so it was checked as a new bet.)"
+        : "";
+    const all = (problem: string): Verdict => ({ problems: orders.map(() => problem + note), addsRisk: true });
     const limits = this.options.limits;
 
-    if (kill) {
-      return all(
-        `KILL_SWITCH_ENGAGED: no new risk${kill.engagedAt ? ` since ${kill.engagedAt}` : ""} (${kill.reason}). Bets that close positions still go through. Only the account holder can release it: ${this.killSwitchReleaseHint()}.`,
-      );
-    }
-    const blocked = this.options.addRiskBlocked?.();
-    if (blocked) return all(`READ_ONLY_PROCESS: ${blocked}`);
+    const blocked = this.blockedNow();
+    if (blocked) return all(blocked);
     if (this.mode === "live" && market.book.isMarketDataDelayed) {
       return all(
         "DELAYED_DATA: Betfair is sending this market's prices with a delay (a delayed app key, an unfunded account or a throttled live key), so no real-money bet that adds risk is placed on it.",
@@ -491,38 +524,48 @@ export class GuardedExchange implements Exchange {
       return {
         problems: orders.map(
           (_, i) =>
-            (perBet[i] ?? `BATCH_REFUSED: not sent because the bet on ${name} in the same request was refused (${perBet[first]!.split(":")[0]}); bets sent together go all or nothing.`) +
-            flagged(i),
+            (perBet[i] ?? `BATCH_REFUSED: not sent because the bet on ${name} in the same request was refused (${perBet[first]!.split(":")[0]}); bets sent together go all or nothing.`) + note,
         ),
         addsRisk: true,
       };
     }
 
-    // Market: unmatched and possibly-placed bets counted where they hurt.
+    // Market: unmatched and possibly-placed bets counted where they hurt (exact, or an upper bound
+    // when the outcomes can't be enumerated).
     const known = [...market.legs, ...market.phantoms];
+    const all_ = [...known, ...legs];
+    const exact = enumerable(all_.map((l) => l.key), market.shape);
     const before = worstLoss(known, market.shape, "hurt");
-    const after = worstLoss([...known, ...legs], market.shape, "hurt");
+    const after = worstLoss(all_, market.shape, "hurt");
     if (after > limits.maxMarketLiability + EPS) {
       return all(
         `MAX_MARKET_LIABILITY: this would take the market's worst-case loss from ${money(before)} to ${money(after)}, above MAX_MARKET_LIABILITY ${limits.maxMarketLiability}.`,
       );
     }
-    // What the exchange's own exposure figure does not show yet: this request, plus this market's possibly-placed bets.
-    const added = Math.max(0, after - worstLoss(market.legs, market.shape, "hurt"));
+    // What the exchange's exposure figure doesn't show yet: this request and the market's possibly-placed
+    // bets. With an upper bound only the whole bound is safe to add (the difference of two bounds isn't one).
+    const added = exact ? Math.max(0, after - worstLoss(market.legs, market.shape, "hurt")) : after;
 
-    // Account and day: one request at a time, with requests in flight reserved.
+    // Account and day: one request at a time, with requests still on their way reserved.
     return this.withAccountQueue(async (): Promise<Verdict> => {
+      // Snapshot before reading the account: a request that has landed is in the figures read below; one
+      // still on its way is not, so it stays counted until a read that starts after it landed.
+      let pending = 0;
+      for (const [id, r] of this.reservations) {
+        if (r.landed) this.reservations.delete(id);
+        else pending += r.amount;
+      }
+      const now = this.now();
+      // Possibly-placed bets on other markets: the exchange's figure doesn't include them either.
+      for (const u of this.unconfirmed) if (u.until > now && u.marketId !== market.book.marketId) pending += legLiability(u.leg);
       let account: AccountRisk;
       try {
         account = await this.accountRisk();
       } catch (error) {
         return all(`RISK_CHECK_FAILED: could not read the account's exposure or today's results (${(error as Error).message}); nothing that adds risk was sent. Try again.`);
       }
-      let pending = 0;
-      for (const value of this.reservations.values()) pending += value;
-      const now = this.now();
-      // Possibly-placed bets on other markets: the exchange's figure doesn't include them either.
-      for (const u of this.unconfirmed) if (u.until > now && !market.phantoms.includes(u.leg)) pending += legLiability(u.leg);
+      const stopped = this.blockedNow();
+      if (stopped) return all(stopped);
       const total = account.exposure + pending + added;
       if (total > limits.maxTotalExposure + EPS) {
         return all(`MAX_TOTAL_EXPOSURE: open worst-case loss would be ${money(total)}, above MAX_TOTAL_EXPOSURE ${limits.maxTotalExposure}.`);
@@ -538,36 +581,13 @@ export class GuardedExchange implements Exchange {
         );
       }
       const reservation = ++this.nextReservation;
-      this.reservations.set(reservation, added);
+      this.reservations.set(reservation, { amount: added, landed: false });
       return { problems: orders.map(() => undefined), addsRisk: true, reservation };
     });
   }
 
-  /**
-   * True when the request only closes positions: every bet reduces its own selection's matched
-   * position without lowering its worst case (resting bets on the same side and possibly-placed
-   * ones counted as matched), and with all of them matched the market's matched worst case is no
-   * higher than now.
-   */
-  private closes(market: MarketRisk, legs: Leg[]): boolean {
-    const matched = matchedPart(market.legs);
-    for (const [i, leg] of legs.entries()) {
-      let position = matchedPosition(matched, leg.key);
-      for (const earlier of legs.slice(0, i)) if (earlier.key === leg.key) position = addBet(position, earlier.side, earlier.price, earlier.remaining);
-      const diff = position.ifWin - position.ifLose;
-      if (Math.abs(diff) < 0.01) return false;
-      const closingSide: Side = diff > 0 ? "LAY" : "BACK";
-      if (leg.side !== closingSide) return false;
-      for (const other of [...market.legs, ...market.phantoms]) {
-        if (other.key === leg.key && other.side === closingSide && other.remaining > 0 && other.price >= 1.01) {
-          position = addBet(position, other.side, other.price, other.remaining);
-        }
-      }
-      if (worstCase(addBet(position, leg.side, leg.price, leg.remaining)) < worstCase(position) - EPS) return false;
-    }
-    const before = worstLoss(matched, market.shape, "ignore");
-    const after = worstLoss([...matched, ...legs.map(asMatched)], market.shape, "ignore");
-    return after <= before + EPS;
+  private closes(market: MarketRisk, legs: Leg[]): Closing {
+    return closingVerdict([...market.legs, ...market.phantoms], market.shape, legs);
   }
 
   /** The market's book, catalogue and orders, plus orders whose outcome is unknown. Throws when the book or orders cannot be read. */
@@ -579,9 +599,9 @@ export class GuardedExchange implements Exchange {
     } catch {
       catalogue = this.markets.cachedCatalogue(marketId);
     }
-    const orders = (await this.inner.currentOrders([marketId])).filter((o) => o.marketId === marketId);
-    const legs = orders.map(legOfView);
-    const refs = new Set(orders.map((o) => o.customerOrderRef).filter(Boolean));
+    const views = (await this.inner.currentOrders([marketId])).filter((o) => o.marketId === marketId);
+    const legs = views.map(legOfView);
+    const refs = new Set(views.map((o) => o.customerOrderRef).filter(Boolean));
     const now = this.now();
     this.unconfirmed = this.unconfirmed.filter((u) => u.until > now && !(u.ref && refs.has(u.ref)));
     const phantoms = this.unconfirmed.filter((u) => u.marketId === marketId).map((u) => u.leg);
@@ -590,6 +610,7 @@ export class GuardedExchange implements Exchange {
     return {
       book,
       catalogue,
+      views,
       legs,
       phantoms,
       shape: {
@@ -607,6 +628,8 @@ export class GuardedExchange implements Exchange {
    */
   private async accountRisk(): Promise<AccountRisk> {
     const funds = await this.inner.accountFunds();
+    const exposure = Number(funds.exposure);
+    if (funds.exposure === undefined || funds.exposure === null || !Number.isFinite(exposure)) throw new Error("the account's exposure figure is missing");
     const settled = await this.inner.settledBets(new Date(startOfDay(this.now(), this.options.timeZone)));
     if (settled.truncated) throw new Error("too many bets settled today to add up");
     const byMarket = new Map<string, number>();
@@ -621,7 +644,7 @@ export class GuardedExchange implements Exchange {
       settledToday = -settled.commission;
       for (const profit of byMarket.values()) settledToday += profit;
     }
-    return { exposure: Math.abs(Number(funds.exposure) || 0), settledToday, note };
+    return { exposure: Math.abs(exposure), settledToday, note };
   }
 
   // ---------------------------------------------------------------- status and clean-up
@@ -668,10 +691,17 @@ export class GuardedExchange implements Exchange {
     return Math.max(0, -account.settledToday) >= this.options.limits.dailyLossLimit - EPS;
   }
 
+  /** Unmatched SP bets among `orders` (the API can't cancel them), for reports. */
+  private spBets(orders: OrderView[]): string[] {
+    return orders
+      .filter((o) => o.status === "EXECUTABLE" && o.sizeRemaining <= 0 && (o.bspLiability ?? 0) > 0)
+      .map((o) => `${o.betId} (${o.side} at Betfair SP, liability ${money(o.bspLiability!)}, market ${o.marketId})`);
+  }
+
   /** Cancel every unmatched bet on the account (kill switch), market by market; one market's failure doesn't stop the others. */
   async cancelAllUnmatched(): Promise<CancelReport> {
-    const report: CancelReport = { cancelled: [], failures: [] };
     const orders = await this.inner.currentOrders();
+    const report: CancelReport = { cancelled: [], failures: [], uncancellable: this.spBets(orders) };
     for (const marketId of [...new Set(orders.filter((o) => o.sizeRemaining > 0).map((o) => o.marketId))]) {
       try {
         const results = await this.inner.cancelOrders(marketId, "ALL");
@@ -685,31 +715,40 @@ export class GuardedExchange implements Exchange {
   }
 
   /**
-   * Cancel unmatched bets that would add risk if they matched (entries, over-hedges) and keep the
-   * ones that would reduce it. Per selection, oldest first, each kept bet is added to the position
-   * the next one is judged against, so two resting closes can't add up to an over-hedge.
+   * Cancel the unmatched bets that would add risk if they matched and keep the ones that close a
+   * position, judged by the closing rule: first every bet that doesn't reduce a matched position is
+   * cancelled, then the rest, oldest first, each with the others still resting counted as uncertain.
    */
   async cancelRiskAddingUnmatched(): Promise<CancelReport> {
-    const report: CancelReport = { cancelled: [], failures: [] };
     const orders = await this.inner.currentOrders();
-    const byMarket = new Map<string, string[]>();
-    const selections = new Set(orders.map((o) => `${o.marketId}|${o.selectionId}`));
-    for (const id of selections) {
-      const mine = orders.filter((o) => `${o.marketId}|${o.selectionId}` === id);
-      let position = matchedPosition(matchedPart(mine.map(legOfView)), mine[0].selectionId);
-      const resting = mine.filter((o) => o.sizeRemaining > 0 || legOfView(o).spLiability).sort((a, b) => a.placedDate.localeCompare(b.placedDate));
-      for (const o of resting) {
-        const sp = legOfView(o).spLiability;
-        const ifMatched = sp ? undefined : addBet(position, o.side, o.price, o.sizeRemaining);
-        if (!ifMatched || worstCase(ifMatched) < worstCase(position) - EPS) byMarket.set(o.marketId, [...(byMarket.get(o.marketId) ?? []), o.betId]);
-        else position = ifMatched;
-      }
-    }
-    for (const [marketId, betIds] of byMarket) {
+    const report: CancelReport = { cancelled: [], failures: [], uncancellable: this.spBets(orders) };
+    for (const marketId of [...new Set(orders.filter((o) => o.sizeRemaining > 0).map((o) => o.marketId))]) {
       try {
+        const market = await this.marketRisk(marketId);
+        const resting = market.views
+          .map((view, i) => ({ view, i }))
+          .filter(({ view }) => view.sizeRemaining > 0)
+          .sort((a, b) => a.view.placedDate.localeCompare(b.view.placedDate));
+        const cancel = new Set<number>();
+        const judge = (i: number) => {
+          const legs = market.legs.map((leg, j) => (j === i || cancel.has(j) ? matchedOnly(leg) : leg));
+          const view = market.views[i];
+          return this.closes({ ...market, legs }, [{ key: view.selectionId, side: view.side, price: view.price, remaining: view.sizeRemaining, fills: [] }]);
+        };
+        // Bets that don't reduce a matched position add risk whatever else happens.
+        for (const { i } of resting) {
+          const verdict = judge(i);
+          if (!verdict.closing && !verdict.why) cancel.add(i);
+        }
+        for (const { i } of resting) if (!cancel.has(i) && !judge(i).closing) cancel.add(i);
+        const betIds = [...cancel].map((i) => market.views[i].betId);
+        if (!betIds.length) continue;
         const results = await this.inner.cancelOrders(marketId, betIds);
         report.cancelled.push(...results);
-        for (const r of results) if (r.status !== "SUCCESS" && r.status !== "BET_TAKEN_OR_LAPSED") report.failures.push(`${marketId}: bet ${r.betId} ${r.status}`);
+        for (const id of betIds) {
+          const r = results.find((x) => x.betId === id);
+          if (!r || (r.status !== "SUCCESS" && r.status !== "BET_TAKEN_OR_LAPSED")) report.failures.push(`${marketId}: bet ${id} ${r?.status ?? "no result"}`);
+        }
       } catch (error) {
         report.failures.push(`${marketId}: ${(error as Error).message}`);
       }

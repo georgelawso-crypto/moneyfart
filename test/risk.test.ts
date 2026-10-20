@@ -160,7 +160,7 @@ describe("risk guard: limits that strategies cannot get around", () => {
     // Flagged as closing, but it would reverse the position into a 51.50 loss if 101 wins.
     const [overHedge] = await c.exchange.placeOrders(WIN_MARKET, [order(101, "LAY", 3.05, 30, { reducesRisk: true })], TAG);
     assert.equal(overHedge.status, "FAILURE");
-    assert.match(overHedge.errorCode!, /^MAX_LIABILITY: liability 61.50 exceeds MAX_LIABILITY 25\. \(It was sent as a closing bet, but it doesn't close a position, so it was checked as a new bet\.\)$/);
+    assert.match(overHedge.errorCode!, /^MAX_LIABILITY: liability 61.50 exceeds MAX_LIABILITY 25\. \(It reduces the position on its selection, but it isn't counted as a closing bet: with the bets already resting on the same side it would close more than the whole position\.\)$/);
 
     // The equal-profit hedge never raises the worst case, so it goes through even with the kill switch
     // on, and even without the flag: bets are judged by what they do, not by what they say.
@@ -170,7 +170,7 @@ describe("risk guard: limits that strategies cannot get around", () => {
     assert.equal(hedge.sizeMatched, 9.84);
     // Now flat: any further lay on 101 would be new risk, and the kill switch stops it.
     const [more] = await c.exchange.placeOrders(WIN_MARKET, [order(101, "LAY", 3.05, 5, { reducesRisk: true })], TAG);
-    assert.match(more.errorCode!, /^KILL_SWITCH_ENGAGED: .*It was sent as a closing bet, but it doesn't close a position/);
+    assert.match(more.errorCode!, /^KILL_SWITCH_ENGAGED: .*It was sent as a closing bet, but it doesn't reduce a matched position on its selection/);
   });
 
   test("MAX_MARKET_LIABILITY caps the market's worst case across bets and selections", async () => {
@@ -344,7 +344,7 @@ describe("kill switch", () => {
     assert.equal(owner.bots.list({ status: "running" }).length, 0);
 
     const [blocked] = await owner.exchange.placeOrders(WIN_MARKET, [order(101, "BACK", 3.0, 5)], TAG);
-    assert.match(blocked.errorCode!, /^KILL_SWITCH_ENGAGED: .*\(too many losses\)\. Bets that close positions still go through\. Only the account holder can release it: delete /);
+    assert.match(blocked.errorCode!, /^KILL_SWITCH_ENGAGED: .*\(too many losses\)\. Bets that close a position still go through\. Only the account holder can release it: delete /);
     // Engaging again keeps the first reason.
     assert.equal(owner.guard.engageKillSwitch("again").reason, "too many losses");
     owner.shutdown();

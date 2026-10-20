@@ -41,6 +41,8 @@ export interface PlacedBet {
   customerOrderRef?: string;
   /** Something the caller should pass on, e.g. a paper fill made on delayed data. */
   warning?: string;
+  /** Set when the risk guard refused the bet (it never reached the exchange). */
+  refusedBy?: "risk-guard";
 }
 
 export interface CancelResult {

@@ -927,7 +927,18 @@ export class StrategyEngine {
     }
     let hedged = 0;
     if (hedges.length) {
-      const placements = await this.desk.place(market.id, hedges, exec.tag, market.rules, market.ladder);
+      // One selection per request: the risk guard counts a single selection's close as closing, and
+      // closes don't need to go all or nothing. One the guard refused can go through once the other
+      // selections are closed, so those are tried once more.
+      const results = new Map<PlannedOrder, Placement>();
+      const send = async (hedge: PlannedOrder) => {
+        const [placement] = await this.desk.place(market.id, [hedge], exec.tag, market.rules, market.ladder);
+        results.set(hedge, placement);
+      };
+      for (const hedge of hedges) await send(hedge);
+      const retry = hedges.filter((h) => results.get(h)?.bet?.refusedBy);
+      if (retry.length && hedges.some((h) => results.get(h)?.bet?.status === "SUCCESS")) for (const hedge of retry) await send(hedge);
+      const placements = hedges.map((h) => results.get(h)!);
       run.placements(placements);
       hedged = placements.filter((p) => p.bet?.status === "SUCCESS").length;
       failed += placements.filter((p) => !p.bet || p.bet.status === "FAILURE").length;
