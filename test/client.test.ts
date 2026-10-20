@@ -16,7 +16,7 @@ function fakeFetch(handler: Handler) {
   return { fetchImpl, requests };
 }
 
-const betfairConfig = (env: Record<string, string>) => loadConfig({ BETFAIR_APP_KEY: "app-key", ...env }).betfair;
+const betfairConfig = (env: Record<string, string>) => loadConfig({ BETFAIR_JURISDICTION: "com", BETFAIR_APP_KEY: "app-key", ...env }).betfair;
 const CREDENTIALS = { BETFAIR_USERNAME: "u", BETFAIR_PASSWORD: "p" };
 
 const rpcResult = (result: unknown) => ({ jsonrpc: "2.0", result, id: 1 });

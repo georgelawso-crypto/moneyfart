@@ -1,6 +1,7 @@
 // Betfair minimum bet rules per account currency. A LIMIT bet below the minimum stake is
 // still accepted when stake x price reaches the minimum payout (not on .it/.es exchanges).
-// Values follow betfairlightweight's currency_parameters (GBP minimum stake is 1 since Feb 2022).
+// Values follow betfairlightweight's current currency_parameters (betfairlightweight/metadata.py,
+// from Betfair's "Currency Parameters" table; GBP minimum stake is 1 since Feb 2022).
 
 export interface CurrencyRules {
   currency: string;
@@ -11,14 +12,15 @@ export interface CurrencyRules {
 const RULES: Record<string, Omit<CurrencyRules, "currency">> = {
   GBP: { minBetSize: 1, minBetPayout: 10 },
   EUR: { minBetSize: 1, minBetPayout: 20 },
-  USD: { minBetSize: 3, minBetPayout: 20 },
+  USD: { minBetSize: 1, minBetPayout: 20 },
   AUD: { minBetSize: 5, minBetPayout: 30 },
-  CAD: { minBetSize: 6, minBetPayout: 30 },
+  NZD: { minBetSize: 2, minBetPayout: 10 },
+  CAD: { minBetSize: 2, minBetPayout: 30 },
   HKD: { minBetSize: 10, minBetPayout: 125 },
-  DKK: { minBetSize: 30, minBetPayout: 150 },
-  NOK: { minBetSize: 30, minBetPayout: 150 },
-  SEK: { minBetSize: 30, minBetPayout: 150 },
-  SGD: { minBetSize: 6, minBetPayout: 30 },
+  DKK: { minBetSize: 15, minBetPayout: 150 },
+  NOK: { minBetSize: 10, minBetPayout: 150 },
+  SEK: { minBetSize: 15, minBetPayout: 150 },
+  SGD: { minBetSize: 2, minBetPayout: 30 },
 };
 
 export function currencyRules(currency: string, overrides: { minBetSize?: number; minBetPayout?: number } = {}): CurrencyRules {

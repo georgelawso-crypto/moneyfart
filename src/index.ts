@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { loadConfig } from "./config.js";
+import { JURISDICTIONS, checkLiveSafety, loadConfig } from "./config.js";
 import { Connector } from "./connector.js";
 import { checkHttpSecurity, createHttpServer } from "./http.js";
 import { createServer } from "./server.js";
@@ -10,6 +10,7 @@ const log = (message: string) => console.error(`[betfair-ai-trading] ${message}`
 async function main() {
   const config = loadConfig();
   const useStdio = process.argv.includes("--stdio") || process.env.MCP_TRANSPORT === "stdio";
+  checkLiveSafety(config);
   if (!useStdio) checkHttpSecurity(config);
 
   const connector = new Connector(config);
@@ -33,7 +34,12 @@ async function main() {
   process.on("unhandledRejection", (reason) => log(`unhandled rejection: ${reason instanceof Error ? reason.stack : reason}`));
 
   if (!connector.betfairConfigured) log("Betfair credentials are not configured; only the prompt library tools will work.");
-  log(`trading mode: ${connector.exchange.mode.toUpperCase()}, tool names: ${config.output.toolNames}`);
+  log(`trading mode: ${connector.exchange.mode.toUpperCase()}, Betfair: ${JURISDICTIONS[config.betfair.jurisdiction].label}, tool names: ${config.output.toolNames}`);
+  const t = config.trading;
+  log(
+    `risk limits: stake ${t.maxStake}, liability ${t.maxLiability} per bet; ${t.maxMarketLiability} per market; ${t.maxTotalExposure} open in total; ` +
+      `daily loss ${t.dailyLossLimit}${connector.killSwitch() ? "; KILL SWITCH ENGAGED (no new risk)" : ""}`,
+  );
   connector.start();
 
   if (useStdio) {

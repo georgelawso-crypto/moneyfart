@@ -244,11 +244,13 @@ export class LiveExchange implements Exchange {
 
   async accountFunds(): Promise<FundsView> {
     const [funds, rules] = await Promise.all([this.api.getAccountFunds(), this.currencyRules()]);
+    // A missing figure is not "nothing open": the risk guard must not read it as zero.
+    if (typeof funds?.exposure !== "number" || !Number.isFinite(funds.exposure)) throw new Error("Betfair's getAccountFunds answer had no exposure figure.");
     return {
       mode: "live",
       currency: rules.currency,
       availableToBetBalance: funds.availableToBetBalance,
-      exposure: Math.abs(funds.exposure ?? 0),
+      exposure: Math.abs(funds.exposure),
       retainedCommission: funds.retainedCommission,
       exposureLimit: funds.exposureLimit,
       discountRate: funds.discountRate,
@@ -372,6 +374,7 @@ export class LiveExchange implements Exchange {
       matchedDate: o.matchedDate,
       strategy: this.state.strategyNameForRef(o.customerStrategyRef),
       customerOrderRef: o.customerOrderRef,
+      ...(o.bspLiability ? { bspLiability: o.bspLiability } : {}),
     };
   }
 

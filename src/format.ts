@@ -12,7 +12,9 @@ export interface SelectionRef {
  * "<id>_<handicap>" form is kept only for non-zero handicaps (Asian handicap lines).
  */
 export function formatSelectionId(selectionId: number, handicap = 0): string {
-  return handicap ? `${selectionId}_${handicap.toFixed(2)}` : String(selectionId);
+  // Handicap lines are quarter points: one that rounds to 0.00 is the runner itself, never a second selection.
+  const line = Math.round((handicap || 0) * 100) / 100;
+  return line ? `${selectionId}_${line.toFixed(2)}` : String(selectionId);
 }
 
 /** Accepts "98427997", "98427997_0.00", "98427997_-1.50" and numbers. */
