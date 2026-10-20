@@ -584,7 +584,7 @@ export function createServer(connector: Connector, session: SessionContext = sta
     annotations: BETTING,
     run: async ({ botId, closePosition }) => {
       // The bots listed here belong to the owning process: stopping or closing them here would act twice.
-      if (state.readOnly) throw new Error(readOnlyBotsMessage(state));
+      if (!state.ownsDataDir()) throw new Error(readOnlyBotsMessage(state));
       return { json: await bots.stop(botId, { closePosition }) };
     },
   });
@@ -674,7 +674,7 @@ export function createServer(connector: Connector, session: SessionContext = sta
     StopAllBots: {
       description: "Stop every running strategy bot (positions stay open).",
       run: async () => {
-        if (state.readOnly) throw new Error(readOnlyBotsMessage(state));
+        if (!state.ownsDataDir()) throw new Error(readOnlyBotsMessage(state));
         return `Stopped ${await bots.stopAll()} bot(s).`;
       },
     },

@@ -154,6 +154,8 @@ export class State {
   private contextBytes = 0;
   /** Custom settings as last loaded or saved: a read-only process's own edits are the ones that differ. */
   private savedStrategies = new Map<string, string>();
+  /** Ids of the bots as last loaded or saved: one of them missing from state.json later was removed by its owner. */
+  private savedBotIds = new Set<string>();
 
   constructor(
     private readonly file?: string,
@@ -306,6 +308,8 @@ export class State {
   flush() {
     if (this.saveTimer) clearTimeout(this.saveTimer);
     this.saveTimer = undefined;
+    // A read-only process whose owner has just exited takes DATA_DIR over now (which saves), so its changes are not lost.
+    if (this.dirty && this.readOnly) this.tryTakeOver();
     if (this.dirty) this.trySave();
   }
 
@@ -351,6 +355,7 @@ export class State {
     syncDirectory(path.dirname(this.file));
     this.dirty = false;
     this.savedStrategies = strategySnapshot(this.customStrategies);
+    this.savedBotIds = new Set(this.bots.map((b) => b.id));
   }
 
   /** Release the DATA_DIR lock (call on shutdown after flush()). */
@@ -576,6 +581,7 @@ export class State {
     this.strategyRefs = new Map(Object.entries(data.strategyRefs ?? {}));
     this.paper = data.paper ?? emptyLedger();
     this.bots = data.bots ?? [];
+    this.savedBotIds = new Set(this.bots.map((b) => b.id));
     for (const market of data.archive ?? []) this.archive.set(market.marketId, market);
   }
 
@@ -623,17 +629,27 @@ export class State {
     refill(this.strategyRefs, refs);
 
     // Paper ledger: the owner's records win; orders and settlements only this process made are added.
+    // An order this process settled stays settled when the owner's copy is not: this process's
+    // settlement record for the market already counts it, and settling it again would count it twice.
     const ledger = saved.paper ?? emptyLedger();
+    const ownOrders = new Map(this.paper.orders.map((o) => [o.betId, o]));
     const savedBets = new Set(ledger.orders.map((o) => o.betId));
     const orders = this.paper.orders.filter((o) => !savedBets.has(o.betId));
     const settledMarkets = new Set(ledger.settlements.map((s) => s.marketId));
-    refillArray(this.paper.orders, [...ledger.orders, ...orders]);
+    const savedOrders = ledger.orders.map((o) => {
+      const own = ownOrders.get(o.betId);
+      return !o.settlement && own?.settlement && !settledMarkets.has(o.marketId) ? own : o;
+    });
+    refillArray(this.paper.orders, [...savedOrders, ...orders]);
     refillArray(this.paper.settlements, [...ledger.settlements, ...this.paper.settlements.filter((s) => !settledMarkets.has(s.marketId))]);
     this.paper.betCounter = Math.max(this.paper.betCounter, ledger.betCounter ?? 0);
     if (ledger.markets || this.paper.markets) this.paper.markets = { ...this.paper.markets, ...ledger.markets };
 
+    // Bots: the owner's copies win. A bot this process last loaded or saved that is missing now was
+    // pruned by the owner after it ended; only bots started here since then are added.
     const savedBots = new Set((saved.bots ?? []).map((b) => b.id));
-    refillArray(this.bots, [...(saved.bots ?? []), ...this.bots.filter((b) => !savedBots.has(b.id))]);
+    refillArray(this.bots, [...(saved.bots ?? []), ...this.bots.filter((b) => !savedBots.has(b.id) && !this.savedBotIds.has(b.id))]);
+    this.savedBotIds = savedBots;
 
     const archive = new Map((saved.archive ?? []).map((m) => [m.marketId, m]));
     for (const [id, market] of this.archive) if (!archive.has(id)) archive.set(id, market);

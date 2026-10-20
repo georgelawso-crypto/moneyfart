@@ -9,6 +9,7 @@ import { loadConfig } from "../src/config.js";
 import { Connector } from "../src/connector.js";
 import type { PaperOrder } from "../src/exchange/paperTypes.js";
 import { createServer } from "../src/server.js";
+import type { BotState } from "../src/strategies/botTypes.js";
 import { LOCK_RETRY_MS, State, type SettledMarket } from "../src/state.js";
 import { FakeBetfair, WIN_MARKET } from "./fakeBetfair.js";
 
@@ -466,5 +467,129 @@ describe("read-only connector process", () => {
     await client.close();
     owner.shutdown();
     reader.shutdown();
+  });
+});
+
+describe("takeover merge and lock loss (review)", () => {
+  const env = { TRADING_MODE: "live", RECORD_INTERVAL_SECONDS: "0", BOT_INTERVAL_SECONDS: "0" };
+  const sel101 = [{ selectionId: 101, handicap: 0 }];
+  const placeOrders = (fake: FakeBetfair) => fake.calls.filter((c) => c.method === "placeOrders").length;
+
+  function bot(id: string): BotState {
+    const at = new Date().toISOString();
+    return { id, strategyName: "S", template: "Place Bet", marketId: WIN_MARKET, selectionId: 101, handicap: 0, createdAt: at, updatedAt: at, status: "running", parameters: {}, betIds: [], log: [] };
+  }
+
+  test("a bot the owner pruned after it ended is not resurrected (and re-run) by the process that takes over", async () => {
+    const dir = tmpDir();
+    const config = loadConfig({ ...env, DATA_DIR: dir });
+    const owner = new Connector(config, new FakeBetfair(), State.forDataDir(dir));
+    const started = await owner.executeStrategy("Bet 10 Euro", WIN_MARKET, sel101, { PlaceBetTimeSpan: "-0:25:00" });
+    assert.equal(started.outcome, "Started", JSON.stringify(started));
+    owner.state.bots[0].meta!.placeAt = Date.now() - 1000;
+    owner.state.changed();
+    owner.state.flush();
+    const fake = new FakeBetfair();
+    let reader!: Connector;
+    await logsOf(() => (reader = new Connector(config, fake, State.forDataDir(dir))));
+    assert.equal(reader.state.bots.length, 1, "the reader loaded the owner's running bot");
+
+    // The owner placed the bet, the bot ended and was pruned (more than KEEP_ENDED_BOTS ended bots), then the owner exited.
+    owner.state.bots = [];
+    owner.state.changed();
+    owner.shutdown();
+
+    await logsOf(() => assert.equal(reader.state.tryTakeOver(), true));
+    assert.deepEqual(reader.state.bots, [], "the stale running copy is dropped");
+    await reader.botTick();
+    assert.equal(placeOrders(fake), 0, "the bet the owner already placed must not be placed again");
+    reader.shutdown();
+  });
+
+  test("a bot started after this process's last save is kept when it takes DATA_DIR back", async () => {
+    const dir = tmpDir();
+    const state = State.forDataDir(dir);
+    state.bots.push(bot("bot-saved"));
+    state.changed();
+    state.flush();
+    // Another process took DATA_DIR over (this one was suspended), and this one started a bot meanwhile.
+    fs.writeFileSync(lockOf(dir), foreignLock(process.pid));
+    state.bots.push(bot("bot-unsaved"));
+    await logsOf(() => {
+      state.changed();
+      state.flush();
+    });
+    assert.equal(state.readOnly, true);
+    // The other process pruned bot-saved, saved and exited.
+    const saved = readJson(stateOf(dir));
+    saved.bots = [];
+    fs.writeFileSync(stateOf(dir), JSON.stringify(saved));
+    fs.rmSync(lockOf(dir));
+    await logsOf(() => assert.equal(state.tryTakeOver(), true));
+    assert.deepEqual(
+      state.bots.map((b) => b.id),
+      ["bot-unsaved"],
+    );
+    assert.deepEqual(
+      readJson(stateOf(dir)).bots.map((b: BotState) => b.id),
+      ["bot-unsaved"],
+    );
+    state.release();
+  });
+
+  test("a paper market the read-only process settled is not settled (and counted) a second time after the takeover", async () => {
+    const dir = tmpDir();
+    const owner = State.forDataDir(dir);
+    owner.paper.orders.push(paperOrder("P1"));
+    owner.changed();
+    owner.flush();
+    let reader!: State;
+    await logsOf(() => (reader = State.forDataDir(dir)));
+    // The reader saw the market settle: its copy of P1 is settled and its settlement record counts P1.
+    const settledAt = new Date().toISOString();
+    reader.paper.orders[0].settlement = { outcome: "WON", profit: 4, settledDate: settledAt };
+    reader.paper.settlements.push({ marketId: WIN_MARKET, marketName: "Race", eventName: "Event", grossProfit: 4, commission: 0.2, settledDate: settledAt });
+    // The owner exits before it sees the result.
+    owner.release();
+
+    await logsOf(() => assert.equal(reader.tryTakeOver(), true));
+    const p1 = reader.paper.orders.find((o) => o.betId === "P1")!;
+    assert.equal(p1.settlement?.profit, 4, "P1 stays settled: the paper engine would otherwise settle it again and add its profit twice");
+    assert.equal(reader.paper.settlements.length, 1);
+    assert.equal(readJson(stateOf(dir)).paper.orders[0].settlement.profit, 4);
+    reader.release();
+  });
+
+  test("an owner whose lock was taken over refuses bot-starting strategies before placing the entry", async () => {
+    const dir = tmpDir();
+    const fake = new FakeBetfair();
+    const owner = new Connector(loadConfig({ ...env, DATA_DIR: dir }), fake, State.forDataDir(dir));
+    assert.equal(owner.state.readOnly, false);
+    fs.writeFileSync(lockOf(dir), foreignLock(process.pid));
+    let result!: Awaited<ReturnType<Connector["executeStrategy"]>>;
+    await logsOf(async () => (result = await owner.executeStrategy("Trade x profit", WIN_MARKET, sel101)));
+    assert.equal(result.status, false, JSON.stringify(result));
+    assert.match(result.message!, /starts a bot, so nothing was executed/);
+    assert.equal(placeOrders(fake), 0, "no unmanaged entry");
+    assert.equal(owner.state.bots.length, 0);
+    owner.shutdown();
+  });
+
+  test("a read-only process that exits just after the owner saves its changes instead of losing them", async () => {
+    const dir = tmpDir();
+    const owner = State.forDataDir(dir);
+    owner.setDataContext("1.1", "Owner", 1);
+    owner.flush();
+    let reader!: State;
+    await logsOf(() => (reader = State.forDataDir(dir)));
+    reader.setDataContext("1.2", "Reader", 2);
+    owner.release();
+    // Both clients quit: the reader's exit handler runs before its next lock retry.
+    await logsOf(() => reader.flush());
+    reader.release();
+    const saved = readJson(stateOf(dir));
+    assert.equal(saved.dataContexts["1.1"].Owner.data, 1);
+    assert.equal(saved.dataContexts["1.2"].Reader.data, 2);
+    assert.equal(fs.existsSync(lockOf(dir)), false, "the lock is released on exit");
   });
 });

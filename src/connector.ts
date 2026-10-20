@@ -118,7 +118,8 @@ export class Connector {
    * not run bots, so their positions would go unmanaged.
    */
   async executeStrategy(strategyName: string, marketId: string, selections: SelectionRef[], overrides: Record<string, unknown> = {}): Promise<ExecutionResult> {
-    if (this.state.readOnly) {
+    // ownsDataDir re-reads the lock: an owner whose lock was taken over (e.g. after a suspend) is read-only from now on.
+    if (!this.state.ownsDataDir()) {
       // Settings or parameters that do not resolve are reported by the engine itself.
       const starter = await this.botStartingSetting(strategyName, marketId, overrides).catch(() => undefined);
       if (starter) {
