@@ -155,12 +155,16 @@ Paper mode aims to keep paper results honest, so a strategy shouldn't look profi
 ## Safety
 
 - **Paper by default.** In live mode the server instructions tell Claude to confirm bets unless you asked for autonomous execution. Library prompts that place bets are flagged and carry the same note.
-- **Risk guard:** every order, from any strategy, bot or tool, passes one guard on its way to the paper or live exchange (`src/exchange/guard.ts`). It judges a bet by what it does to the market's worst-case loss (Betfair's exposure rule: matched bets exactly, unmatched ones where they hurt), not by what the caller says it is:
-  - a bet that doesn't raise the worst case (closing a position) always goes through, even with the kill switch on;
-  - a bet that raises it, whatever it is labelled, must fit `MAX_STAKE` and `MAX_LIABILITY` (per bet), `MAX_MARKET_LIABILITY` (the market's worst case afterwards), `MAX_TOTAL_EXPOSURE` (everything open) and `DAILY_LOSS_LIMIT` (today's settled losses plus the worst case of everything open: the most the connector can lose in a day);
-  - placements are checked one at a time, so two requests can't both use the same headroom, and a bet whose outcome is unknown after a timeout counts as open until it is found.
+- **Risk guard:** every order, from any strategy, bot or tool, passes one guard on its way to the paper or live exchange (`src/exchange/guard.ts`). It judges bets by what they do, not by what the caller says they are:
+  - **Closing bets go through**, even with the kill switch on: every bet in the request must reduce its own selection's matched position (resting bets on the same side counted, so two closes can't add up to an over-hedge), and with all of them matched the market's worst case must be no higher than now. Close Market Bet Position closes a whole market this way; closing one selection on its own is refused when that would raise the market's worst case (for example lays on two runners that cover each other).
+  - **Everything else is new risk** and must fit `MAX_STAKE` and `MAX_LIABILITY` (per bet), `MAX_MARKET_LIABILITY` (the market's worst case, unmatched bets counted where they hurt), `MAX_TOTAL_EXPOSURE` (everything open) and `DAILY_LOSS_LIMIT` (today's settled losses plus the worst case of everything open: the most the connector can lose in a day).
+  - **All or nothing:** one refused bet refuses its whole request, so a dutch is never left half placed.
+  - **Fails closed:** if the guard can't read the market, its orders, the account or today's results, it refuses and the caller retries. A bet whose outcome is unknown after a timeout counts as possibly placed until it is found.
+  - **No shared headroom:** placements on a market are checked one at a time and account-level checks reserve what's in flight; only the process that owns `DATA_DIR` adds risk.
+  - **Exposure model:** win and place markets work out every combination of winners among the selections you have bets on (up to 12), handicap and line markets count each selection on its own, and SP bets count at their SP liability.
 - **Live mode needs your limits:** with `TRADING_MODE=live` the connector refuses to start until all five limits are set in the environment. Claude can read them but not change them.
-- **Kill switch:** `kill_switch` with `engage` blocks new risk, stops every bot and cancels every unmatched bet; matched positions stay open and can still be closed. Only you can release it, by deleting `DATA_DIR/kill-switch.json` (or restarting, without `DATA_DIR`). Every process sharing `DATA_DIR` sees it, and a damaged file counts as engaged. Once today's settled losses reach `DAILY_LOSS_LIMIT`, the connector also cancels unmatched bets that would add risk and keeps resting closing bets.
+- **Kill switch:** `kill_switch` with `engage` blocks everything but closing bets, stops every bot and cancels every unmatched bet; a bet already on its way when it engages has its unmatched part cancelled when it lands. Matched positions stay open and can still be closed. Only you can release it, by deleting `DATA_DIR/kill-switch.json` (or restarting, without `DATA_DIR`). Every process sharing `DATA_DIR` sees it within a few seconds, a damaged file counts as engaged, and if the file can't be written it still holds in the process that engaged it.
+- **Daily clean-up:** once today's settled losses reach `DAILY_LOSS_LIMIT`, the connector cancels unmatched bets that would add risk and keeps resting closing bets. Bots keep managing their positions, and a closing bet the guard refuses is retried on the next tick rather than abandoned.
 - **Delayed data:** live mode refuses bets that add risk while Betfair sends a market's prices with a delay (a delayed app key, an unfunded account or a throttled live key). Paper mode still fills, but every result says the fill doesn't show what a live bet would have done.
 - **Strategy limits:** strategies also check `MAX_STAKE` and `MAX_LIABILITY` before sending, including dutch totals. Closing bets are sized exactly and never reverse a position.
 - **Idempotent live orders:** each order carries a `customerRef` and `customerOrderRef`. A timeout is checked against Betfair before anything is reported, and an unconfirmed bet is reported as `UNKNOWN` rather than "failed", so the model won't double-bet.
@@ -177,7 +181,7 @@ Paper mode aims to keep paper results honest, so a strategy shouldn't look profi
   - each conversation gets its own MCP session and its own active market.
 - **Persistence:** `DATA_DIR` holds the paper ledger, AI contexts, custom settings, bots and settled results.
   - **Lock:** one process owns `DATA_DIR`. Its lock has a heartbeat and is considered stale after 2 minutes, which also works for containers sharing a volume.
-  - **Second process:** it runs read-only and never runs bots. It takes over, merging its changes, when the owner exits.
+  - **Second process:** it runs read-only, never runs bots and only places bets that close positions. It takes over, merging its changes, when the owner exits.
   - **Safe saves:** saves are fsynced and atomic and happen on every exit path. A corrupt or older-version state file is backed up, never overwritten.
   - **Limits:** stored AI contexts are capped at 1 MB each, 50 names per market and 50 MB in total.
 
@@ -268,13 +272,13 @@ Things to know about hosting:
   - each-way, BSP and line markets are refused in paper mode;
   - reduction factors use a simple multiplicative rule;
   - dead heats on multi-place markets use the average share.
-- **One live process per `DATA_DIR`:** a read-only second process can still run an immediate Close Selection/Market at the same time as the owner's bots, so don't point two live connectors at the same account and `DATA_DIR`.
+- **One live connector per account:** a read-only second process sharing `DATA_DIR` can still close positions at the same time as the owner's bots, and two connectors with different `DATA_DIR`s on one account don't see each other's in-flight bets, so run one live connector per Betfair account.
 - **Settled-result retention:** Betfair keeps runner results for 90 days and cleared orders for 90 days.
 
 ## Development
 
 ```bash
-npm test             # 422 tests: unit, module, MCP end-to-end and HTTP
+npm test             # 450 tests: unit, module, MCP end-to-end and HTTP
 npm run typecheck
 npm run dev          # from source
 npm run sync-prompts # refresh prompts/ from upstream
@@ -286,7 +290,7 @@ npm run sync-prompts # refresh prompts/ from upstream
 | `src/recorder.ts` | Trade reconstruction and aggressor classification |
 | `src/markets.ts` | Catalogues (incl. closed markets), books, monitoring, settled archive, BFExplorer market payload |
 | `src/contexts/` | Data-context providers and envelope |
-| `src/exchange/` | Risk guard, paper and live exchanges, position maths |
+| `src/exchange/` | Risk guard and exposure model, paper and live exchanges, position maths |
 | `src/strategies/` | Templates, built-ins, engine, bots |
 | `src/prompts.ts` | Prompt library, tool-name mapping, compatibility |
 | `src/server.ts`, `src/http.ts`, `src/index.ts`, `src/connector.ts` | MCP surface, transports, wiring |
