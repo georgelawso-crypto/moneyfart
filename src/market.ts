@@ -95,7 +95,7 @@ export class Market {
   }
 
   /**
-   * Absolute volatility per √second: the RMS of recent fresh one-second moves,
+   * Absolute volatility per sqrt-second: the RMS of recent fresh one-second moves,
    * floored at half the market's assumed volatility so a quiet spell (or a
    * closed market) doesn't make far-away bands look impossible.
    */
@@ -112,6 +112,25 @@ export class Market {
     }
     if (samples < MIN_VOLATILITY_SAMPLES) return assumed;
     return Math.max(Math.sqrt(sumSquares / samples), assumed / 2);
+  }
+
+  /**
+   * Same one-second RMS as `sigmaPerSecond`, but with no assumed-vol floor and
+   * no fallback to the annual figure. Undefined until there are enough fresh
+   * samples. This is the estimate a bettor can form without using the house's
+   * floor, so the two numbers diverge only when that floor is binding.
+   */
+  realizedSigma(lookback = VOLATILITY_LOOKBACK, minSamples = MIN_VOLATILITY_SAMPLES): number | undefined {
+    const recent = this.candles.slice(-(lookback + 1));
+    let sumSquares = 0;
+    let samples = 0;
+    for (let i = 1; i < recent.length; i++) {
+      if (!recent[i].fresh || !recent[i - 1].fresh) continue;
+      sumSquares += (recent[i].close - recent[i - 1].close) ** 2;
+      samples++;
+    }
+    if (samples < minSamples) return undefined;
+    return Math.sqrt(sumSquares / samples);
   }
 
   /** Candles over the last `lookbackSeconds`, merged into bars of `barSeconds` aligned to the clock. */
