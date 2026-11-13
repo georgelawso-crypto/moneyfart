@@ -19,7 +19,8 @@
     "start:stdio": "node dist/index.js --stdio",
     "dev": "tsx src/index.ts",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test test/*.test.ts"
+    "test": "node --import tsx --test test/*.test.ts",
+    "simulate": "tsx src/weekly.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.1",
