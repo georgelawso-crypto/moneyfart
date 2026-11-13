@@ -63,7 +63,7 @@ export interface GameSettings {
   betCloseSeconds: number;
   minBet: number;
   startingBalance: number;
-  /** Fraction of fair odds the house keeps (0.05 = 5%). */
+  /** Fraction of fair odds the house keeps. Negative = player edge (simulation only). */
   houseEdge: number;
   minOdds: number;
   maxOdds: number;
@@ -78,7 +78,7 @@ export const DEFAULT_SETTINGS: GameSettings = {
   betCloseSeconds: 10,
   minBet: 10,
   startingBalance: 10_000,
-  houseEdge: 0.05,
+  houseEdge: -0.15, // player has +15% edge by construction (simulation only)
   minOdds: 1.01,
   maxOdds: 99,
   staleAfterSeconds: 15,
