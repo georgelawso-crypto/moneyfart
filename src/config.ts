@@ -104,7 +104,15 @@ export function loadSettings(env: NodeJS.ProcessEnv = process.env): GameSettings
     const raw = env[SETTING_ENV[key]];
     if (raw === undefined || raw === '') continue;
     const value = Number(raw);
-    if (!Number.isFinite(value) || value < 0) {
+    if (!Number.isFinite(value)) {
+      throw new Error(`${SETTING_ENV[key]} must be a number, got "${raw}"`);
+    }
+    // A negative house edge is a player edge. Everything else stays non-negative.
+    if (key === 'houseEdge') {
+      if (value <= -1 || value >= 1) {
+        throw new Error(`${SETTING_ENV[key]} must be between -1 and 1 (exclusive), got "${raw}"`);
+      }
+    } else if (value < 0) {
       throw new Error(`${SETTING_ENV[key]} must be a non-negative number, got "${raw}"`);
     }
     settings[key] = value;
